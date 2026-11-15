@@ -1,0 +1,6 @@
+Modelo,Exactitud ent. (%),Error ent. (%),Exactitud val. CV (%),Exactitud prueba (%),Error prueba (%),Brecha (p. p.),Indice_J,Epocas_Ejecutadas,Mejores_Parametros
+SVM,99.44,0.56,96.39,97.78,2.22,1.67,97.78,[825],"{'C': 2.0, 'gamma': 'scale', 'kernel': 'rbf'}"
+k-NN,94.31,5.69,90.56,90.56,9.44,3.75,90.18,N/A,"{'n_neighbors': 5, 'weights': 'uniform'}"
+Random Forest,99.86,0.14,97.22,92.22,7.78,7.64,89.9,N/A,"{'max_depth': 8, 'min_samples_leaf': 3, 'n_estimators': 100}"
+ANN (MLP),94.03,5.97,92.78,91.11,8.89,2.92,89.11,17,"{'alpha': 1.0, 'hidden_layer_sizes': (64, 32), 'learning_rate_init': 0.005}"
+Árbol de decisión,98.06,1.94,95.97,80.0,20.0,18.06,72.47,N/A,"{'criterion': 'entropy', 'max_depth': 5, 'min_samples_leaf': 6}"
