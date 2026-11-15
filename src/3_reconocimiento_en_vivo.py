@@ -543,21 +543,6 @@ def ejecutar_demostracion():
                 es_humano_candidato = False
                 met_pdi = {"motivo_rechazo": "Fondo de escena vacio", "sim_bilateral": 0.0}
 
-            # Si (0, 0) falla por un leve desfase lateral/vertical, verificar si algún desplazamiento corto cumple
-            if not es_humano_candidato and not rechazo_por_fondo:
-                for dx_c, dy_c in [(-10, 0), (10, 0), (0, -8), (0, 8)]:
-                    y_c = int(np.clip(qy + dy_c, 0, H - qlado))
-                    x_c = int(np.clip(qx + dx_c, 0, W - qlado))
-                    parche_c = frame[y_c : y_c + qlado, x_c : x_c + qlado]
-                    if parche_c.shape[0] == qlado and parche_c.shape[1] == qlado:
-                        img_c, vec_c = preprocesar_ventana_64x64(parche_c)
-                        ok_c, met_c = verificar_estructura_facial_pdi(parche_c, img_c)
-                        if ok_c:
-                            es_humano_candidato = True
-                            met_pdi = met_c
-                            vec_4096 = vec_c
-                            break
-
             # Determinar clasificador activo para Etapa 1
             if modelo_fuerza is None:
                 info_e1_activo = artefactos["mejor_e1_info"]
@@ -574,12 +559,8 @@ def ejecutar_demostracion():
             pred_e1 = int(info_e1_activo["modelo"].predict(f_in_e1)[0])
             telemetria["mse"] = mse_val
 
-            # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
-            umbral_mse = metadata.get("umbral_mse_rostro", 0.0125)
-
-            # Forzar pred_e1 = 1 si es humano candidato por PDI y cumple subespacio
-            if es_humano_candidato and mse_val <= umbral_mse:
-                pred_e1 = 1
+            # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA (tope estricto 0.0042)
+            umbral_mse = min(0.0042, metadata.get("umbral_mse_rostro", 0.0042))
 
             # Validación contra objetos bloqueados en vivo (Tecla [N])
             if lista_negativos_vivo and es_humano_candidato:
@@ -609,14 +590,11 @@ def ejecutar_demostracion():
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
 
-                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real (27 candidatos)
+                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real (15 candidatos acotados)
                 cx_base = qx + qlado // 2
                 cy_base = qy + qlado // 2
-                desplazamientos = [
-                    (-14, 0), (14, 0), (0, -12), (0, 12),
-                    (-10, -10), (10, -10), (-10, 10), (10, 10), (0, 0)
-                ]
-                escalas = [0.92, 1.00, 1.08]
+                desplazamientos = [(-8, 0), (8, 0), (0, -8), (0, 8), (0, 0)]
+                escalas = [0.96, 1.00, 1.04]
 
                 candidatos_lote = []
                 for dx_p, dy_p in desplazamientos:
@@ -629,8 +607,13 @@ def ejecutar_demostracion():
                         parche_s = frame[y1 : y1 + lado_s, x1 : x1 + lado_s]
                         if parche_s.shape[0] >= 32 and parche_s.shape[1] >= 32:
                             im_s, v_s = preprocesar_ventana_64x64(parche_s)
-                            candidatos_lote.append(v_s)
-                            candidatos_lote.append(np.fliplr(im_s).reshape(-1))
+                            ok_s, _ = verificar_estructura_facial_pdi(parche_s, im_s)
+                            if ok_s:
+                                candidatos_lote.append(v_s)
+                                candidatos_lote.append(np.fliplr(im_s).reshape(-1))
+
+                if not candidatos_lote:
+                    candidatos_lote.append(vec_4096)
 
                 matrices_autorizados = [
                     perfiles[c]["matriz_Z_poses"]
