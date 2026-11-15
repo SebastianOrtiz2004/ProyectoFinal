@@ -134,6 +134,30 @@ def extraer_vector_caracteristicas_vivo(pca_model, vector_4096: np.ndarray, scal
     return f, float(mse[0, 0])
 
 
+def obtener_vector_probabilidades(modelo, features, num_clases: int) -> np.ndarray:
+    """
+    Obtiene el vector de probabilidades de pertenencia a cada clase para cualquier
+    clasificador multiclase, alineando las columnas con los IDs numéricos registrados.
+    """
+    vec_probas = np.zeros(num_clases, dtype=np.float64)
+    if hasattr(modelo, "predict_proba"):
+        try:
+            probas_raw = modelo.predict_proba(features)[0]
+            clases = modelo.classes_
+            for idx_c, c in enumerate(clases):
+                if c < num_clases:
+                    vec_probas[int(c)] = probas_raw[idx_c]
+            return vec_probas
+        except Exception:
+            pass
+
+    # Respaldo con predicción directa si no soporta probabilidades continuas
+    pred = int(modelo.predict(features)[0])
+    if pred < num_clases:
+        vec_probas[pred] = 1.0
+    return vec_probas
+
+
 def dibujar_panel_actuador(
     panel_w: int,
     panel_h: int,
@@ -342,6 +366,13 @@ def ejecutar_demostracion():
     metadata = artefactos["metadata"]
 
     nombres_e2 = metadata["nombres_e2"]
+    ids_autorizados = metadata.get(
+        "ids_autorizados",
+        [c for c in nombres_e2.keys() if "desconocido" not in str(nombres_e2[c]).lower()]
+    )
+    id_desconocido = metadata.get("id_desconocido", max(nombres_e2.keys()) if nombres_e2 else 1)
+    perfiles = metadata.get("perfiles_identidad", {})
+    umbral_mse_id = metadata.get("umbral_mse_identidad", 0.0040)
     umbral_conf = metadata.get("umbral_confianza_acceso", 0.65)
 
     modelo_fuerza = None  # None significa Modo Óptimo Automático
@@ -435,40 +466,6 @@ def ejecutar_demostracion():
                             vec_4096 = vec_c
                             break
 
-            # Alineamiento Interno Multi-Posición (invisible al usuario) previo a Etapa 1 y Etapa 2:
-            # Selecciona entre los desplazamientos internos [(0, 0), (-12, 0), (12, 0), (0, -10), (0, 10), (-8, -8), (8, 8)]
-            # (y su reflejo np.fliplr) aquel vector vec_s que minimice dist_geo_0 con respecto a matriz_Z_poses
-            perfil_0 = metadata.get("perfiles_identidad", {}).get(0, None)
-            mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
-
-            if es_humano_candidato and mat_poses_0 is not None:
-                mejor_dist_0 = 1e9
-                mejor_vec_4096 = vec_4096
-                mejor_met_pdi = met_pdi
-
-                for dx_s, dy_s in [(0, 0), (-12, 0), (12, 0), (0, -10), (0, 10), (-8, -8), (8, 8)]:
-                    y_s = int(np.clip(qy + dy_s, 0, H - qlado))
-                    x_s = int(np.clip(qx + dx_s, 0, W - qlado))
-                    parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
-                    if parche_s.shape[0] == qlado and parche_s.shape[1] == qlado:
-                        img_s, v_s = preprocesar_ventana_64x64(parche_s)
-                        cands = [
-                            (img_s, v_s, parche_s),
-                            (np.fliplr(img_s), np.fliplr(img_s).reshape(-1), parche_s),
-                        ]
-                        for i_c, v_c, p_c in cands:
-                            z_c = pca_e2.transform(v_c.reshape(1, -1))[0]
-                            d_c = float(np.min(np.linalg.norm(mat_poses_0 - z_c, axis=1)))
-                            if d_c < mejor_dist_0:
-                                ok_c, m_c = verificar_estructura_facial_pdi(p_c, i_c)
-                                if ok_c:
-                                    mejor_dist_0 = d_c
-                                    mejor_vec_4096 = v_c
-                                    mejor_met_pdi = m_c
-
-                vec_4096 = mejor_vec_4096
-                met_pdi = mejor_met_pdi
-
             # Determinar clasificador activo para Etapa 1
             if modelo_fuerza is None:
                 mod_e1_obj = artefactos["mejor_e1_info"]["modelo"]
@@ -504,9 +501,42 @@ def ejecutar_demostracion():
                 color_cuadro = (0, 165, 255)
                 etiqueta_texto = f"[NO PERSONA: {motivo[:26]}]"
             else:
-                # ETAPA 1 APROBADA -> PASA A ETAPA 2
+                # ETAPA 1 APROBADA -> PASA A ETAPA 2 (Multiclase)
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
+
+                # Micro-alineamiento multi-posición buscando cercanía a cualquiera de las identidades autorizadas
+                mejor_dist_global = 1e9
+                mejor_vec_4096 = vec_4096
+
+                matrices_autorizados = [
+                    perfiles[c]["matriz_Z_poses"]
+                    for c in ids_autorizados
+                    if c in perfiles and perfiles[c].get("matriz_Z_poses") is not None
+                ]
+
+                if matrices_autorizados:
+                    for dx_s, dy_s in [(0, 0), (-8, 0), (8, 0), (0, -6), (0, 6)]:
+                        y_s = int(np.clip(qy + dy_s, 0, H - qlado))
+                        x_s = int(np.clip(qx + dx_s, 0, W - qlado))
+                        parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
+                        if parche_s.shape[0] == qlado and parche_s.shape[1] == qlado:
+                            img_s, v_s = preprocesar_ventana_64x64(parche_s)
+                            ok_s, _ = verificar_estructura_facial_pdi(parche_s, img_s)
+                            if not ok_s:
+                                continue
+                            cands = [v_s, np.fliplr(img_s).reshape(-1)]
+                            for v_cand in cands:
+                                z_cand = pca_e2.transform(v_cand.reshape(1, -1))[0]
+                                dist_cand = min(
+                                    float(np.min(np.linalg.norm(mat_p - z_cand, axis=1)))
+                                    for mat_p in matrices_autorizados
+                                )
+                                if dist_cand < mejor_dist_global:
+                                    mejor_dist_global = dist_cand
+                                    mejor_vec_4096 = v_cand
+
+                vec_4096 = mejor_vec_4096
 
                 # Determinar clasificador activo para Etapa 2
                 if modelo_fuerza is None:
@@ -517,40 +547,53 @@ def ejecutar_demostracion():
                     scaler_e2 = modelos_e2[modelo_fuerza]["scaler"]
 
                 f_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
+                num_clases_totales = max(nombres_e2.keys()) + 1
 
-                # Verificación geométrica multi-pose respecto al perfil de Sebastián (ID 0)
-                z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
-                perfiles = metadata.get("perfiles_identidad", {})
-                perfil_0 = perfiles.get(0, None)
-                radio_ref_0 = perfil_0.get("radio_pose", 12.0) if perfil_0 else 12.0
-                mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
-                if mat_poses_0 is not None and len(mat_poses_0) > 0:
-                    dist_geo_0 = float(np.min(np.linalg.norm(mat_poses_0 - z_e2_raw, axis=1)))
-                else:
-                    dist_geo_0 = float(np.linalg.norm(z_e2_raw - (perfil_0["centroide"] if perfil_0 else 0)))
-                ratio_d_0 = dist_geo_0 / (radio_ref_0 + 1e-6)
-
-                # Voto de los clasificadores de Etapa 2
                 if modelo_fuerza is None:
-                    votos_modelos = []
-                    for nom_cand in ["Random Forest", "SVM", "ANN (MLP)", "k-NN"]:
+                    # Modo Óptimo Automático: promediar vectores de probabilidad
+                    lista_probas = []
+                    for nom_cand in ["SVM", "Random Forest", "ANN (MLP)", "k-NN"]:
                         if nom_cand in modelos_e2:
                             s_cand = modelos_e2[nom_cand]["scaler"]
                             f_cand, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_cand)
-                            votos_modelos.append(int(modelos_e2[nom_cand]["modelo"].predict(f_cand)[0]))
-                    es_sebastian_modelos = (votos_modelos.count(0) >= 2)
+                            v_p = obtener_vector_probabilidades(modelos_e2[nom_cand]["modelo"], f_cand, num_clases_totales)
+                            lista_probas.append(v_p)
+                    if lista_probas:
+                        probas_promedio = np.mean(lista_probas, axis=0)
+                        pred_id = int(np.argmax(probas_promedio))
+                        prob_pred = float(np.max(probas_promedio))
+                    else:
+                        pred_id = int(mod_e2_obj.predict(f_e2)[0])
+                        prob_pred = 0.85
                 else:
-                    f_fuerza, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
-                    es_sebastian_modelos = (int(mod_e2_obj.predict(f_fuerza)[0]) == 0)
+                    v_p = obtener_vector_probabilidades(mod_e2_obj, f_e2, num_clases_totales)
+                    pred_id = int(np.argmax(v_p))
+                    prob_pred = float(np.max(v_p))
 
-                # Separación Limpia entre Sebastián Ortiz (ID 0) y personas no registradas (Mamá / Otros)
-                tiene_flequillo = met_pdi.get("tiene_flequillo", False)
-                if (es_sebastian_modelos or ratio_d_0 <= 1.15) and (ratio_d_0 <= 1.28) and tiene_flequillo and (mse_val <= 0.0036):
-                    pred_id_frame = 0
-                    conf_frame = float(np.clip(0.88 + max(0.0, 1.0 - ratio_d_0) * 0.08, 0.90, 0.96))
+                # Verificación Biométrica Dinámica en Subespacio PCA para la clase predicha pred_id
+                z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
+
+                if pred_id in ids_autorizados and pred_id in perfiles:
+                    perfil_cand = perfiles[pred_id]
+                    mat_poses_cand = perfil_cand.get("matriz_Z_poses", None)
+                    radio_pose_cand = perfil_cand.get("radio_pose", 12.0)
+                    if mat_poses_cand is not None and len(mat_poses_cand) > 0:
+                        dist_geo = float(np.min(np.linalg.norm(mat_poses_cand - z_e2_raw, axis=1)))
+                    else:
+                        dist_geo = float(np.linalg.norm(z_e2_raw - perfil_cand["centroide"]))
+                    ratio_d = dist_geo / (radio_pose_cand + 1e-6)
+
+                    conf_geom = float(np.exp(-0.35 * (ratio_d ** 2)))
+                    conf_frame = float(np.clip(0.55 * prob_pred + 0.45 * conf_geom, 0.10, 0.97))
+
+                    if ratio_d <= 1.20 and mse_e2 <= max(0.0040, umbral_mse_id) and conf_frame >= 0.58:
+                        pred_id_frame = pred_id
+                    else:
+                        pred_id_frame = id_desconocido
+                        conf_frame = float(np.clip(0.70 + min(0.20, max(0.0, ratio_d - 1.0) * 0.30), 0.70, 0.90))
                 else:
-                    pred_id_frame = 1
-                    conf_frame = float(np.clip(0.75 + min(0.13, max(0.0, ratio_d_0 - 0.60) * 0.35), 0.75, 0.88))
+                    pred_id_frame = id_desconocido
+                    conf_frame = float(np.clip(prob_pred, 0.70, 0.95))
 
                 # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 6)
                 buffer_verificacion.append((pred_id_frame, conf_frame))
@@ -564,20 +607,21 @@ def ejecutar_demostracion():
                     telemetria["confianza"] = float(len(buffer_verificacion) / float(BUFFER_FRAMES))
                 else:
                     buffer_verificacion = buffer_verificacion[-BUFFER_FRAMES:]
-                    votos_0 = sum(1 for p, c in buffer_verificacion if p == 0)
-                    votos_1 = sum(1 for p, c in buffer_verificacion if p == 1)
+                    from collections import Counter
+                    conteo = Counter(p for p, c in buffer_verificacion)
+                    id_ganador = conteo.most_common(1)[0][0]
 
-                    if votos_0 > votos_1:
-                        confs_0 = [c for p, c in buffer_verificacion if p == 0]
-                        conf_final = float(np.mean(confs_0)) if confs_0 else 0.94
+                    confs_ganador = [c for p, c in buffer_verificacion if p == id_ganador]
+                    conf_final = float(np.mean(confs_ganador)) if confs_ganador else 0.85
+
+                    if id_ganador in ids_autorizados:
+                        nombre_persona = nombres_e2.get(id_ganador, f"ID {id_ganador}")
                         telemetria["autorizado"] = True
                         color_cuadro = (0, 255, 0)  # Verde brillante
-                        etiqueta_texto = f"Sebastian Ortiz ({conf_final*100:.0f}%) [AUTORIZADO]"
-                        telemetria["identidad_nombre"] = "Sebastian Ortiz"
+                        etiqueta_texto = f"{nombre_persona} ({conf_final*100:.0f}%) [AUTORIZADO]"
+                        telemetria["identidad_nombre"] = nombre_persona
                         telemetria["confianza"] = conf_final
                     else:
-                        confs_1 = [c for p, c in buffer_verificacion if p == 1]
-                        conf_final = float(np.mean(confs_1)) if confs_1 else 0.80
                         telemetria["autorizado"] = False
                         color_cuadro = (0, 0, 255)  # Rojo
                         etiqueta_texto = f"[NO AUTORIZADO: Desconocido] ({conf_final*100:.0f}%)"

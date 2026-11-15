@@ -120,10 +120,31 @@ def cargar_dataset_completo():
 
     print(f"  [DATOS REALES] Clase 0 cargada: {len(X_obj_local)} objetos reales + {len(X_wall_local)} fondos/paredes.")
 
-    # 4. Cargar imágenes de identidades reales (mínimo 15 fotos) ordenadas por fecha reciente
+    # 4. Descubrimiento dinámico de identidades reales en data/dataset_procesado_64x64/ (mínimo 15 fotos)
     dict_identidades = {}
-    for carpeta, (id_num, nombre_persona) in MAPEADO_IDENTIDADES.items():
-        ruta_c = os.path.join(DIR_DATA, carpeta)
+    carpetas_candidatas = sorted(glob.glob(os.path.join(DIR_DATA, "id_*")))
+
+    # Procesar tanto las carpetas mapeadas como cualquier carpeta nueva id_X_...
+    for ruta_c in carpetas_candidatas:
+        if not os.path.isdir(ruta_c):
+            continue
+        carpeta = os.path.basename(ruta_c)
+        if carpeta == "clase_0_no_persona":
+            continue
+
+        # Extraer ID numérico
+        partes = carpeta.split("_")
+        try:
+            id_num = int(partes[1])
+        except (IndexError, ValueError):
+            continue
+
+        # Determinar nombre legible
+        if carpeta in MAPEADO_IDENTIDADES:
+            nombre_persona = MAPEADO_IDENTIDADES[carpeta][1]
+        else:
+            nombre_persona = " ".join(partes[2:]).capitalize() if len(partes) > 2 else f"Persona {id_num}"
+
         archivos_id = sorted(glob.glob(os.path.join(ruta_c, "*.png")), key=os.path.getmtime)
         muestras_id = []
         for f in archivos_id:
@@ -133,7 +154,6 @@ def cargar_dataset_completo():
                     im = cv2.resize(im, (64, 64))
                 im_double = im.astype(np.float64) / 255.0
                 im_mask = aplicar_mascara_eliptica_a_img64(im_double)
-
                 muestras_id.append(im_mask.reshape(-1))
 
         if len(muestras_id) >= 15:
@@ -142,9 +162,9 @@ def cargar_dataset_completo():
                 "carpeta": carpeta,
                 "data": np.array(muestras_id, dtype=np.float64),
             }
-            print(f"  [DATOS REALES] {nombre_persona}: {len(muestras_id)} fotos cargadas (con máscara elíptica).")
+            print(f"  [DATOS REALES] {nombre_persona} (ID {id_num}): {len(muestras_id)} fotos cargadas (con máscara elíptica).")
         else:
-            print(f"  [AVISO] {nombre_persona}: {len(muestras_id)} fotos (<15). Omitida de entrenamiento (sin datos sintéticos).")
+            print(f"  [AVISO] {nombre_persona} (ID {id_num}): {len(muestras_id)} fotos (<15). Omitida de entrenamiento.")
 
     X_obj = np.array(X_obj_local, dtype=np.float64) if X_obj_local else np.empty((0, 4096))
     X_fondo = np.array(X_wall_local, dtype=np.float64) if X_wall_local else np.empty((0, 4096))
@@ -241,9 +261,8 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=None):
     """
     Etapa 2 (Multiclase de Identidad):
-        ID 0: Sebastián Ortiz (250 uniformes + 150 aumentación multi-posición/escala = 400 muestras)
-        ID Desconocido / Otros: 180 rostros Olivetti + 120 objetos/manos + 100 fondos/paredes (400 muestras)
-    Garantiza balance 50/50 estricto (400 vs 400) e inmunidad absoluta ante paredes/puertas en vivo.
+        Para cada ID registrado: hasta 250 uniformes + 150 aumentación multi-posición/escala = 400 muestras.
+        Clase Desconocido / Otros: Olivetti + objetos reales + fondos de la habitación = 400 muestras.
     """
     X_list = []
     y_list = []
@@ -258,7 +277,8 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
         (-3, -3, 1.04, True), (3, 3, 0.96, True)
     ]
 
-    for id_num, info in dict_identidades.items():
+    for id_num in sorted(dict_identidades.keys()):
+        info = dict_identidades[id_num]
         data = info["data"]
         N_data = len(data)
         if N_data > 250:
@@ -267,7 +287,7 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
         else:
             data_sel = data
 
-        np.random.seed(42)
+        np.random.seed(42 + id_num)
         idx_aug = np.random.choice(len(data_sel), size=150, replace=(len(data_sel) < 150))
         muestras_aug = []
         for i, idx_a in enumerate(idx_aug):
@@ -288,7 +308,7 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
         y_list.append(np.full(len(data_clase), id_num, dtype=int))
         nombres_clases[id_num] = info["nombre"]
 
-    # Clase 'Desconocido / Otros': 180 Olivetti + 120 Objetos + 100 Fondos/Paredes
+    # Clase 'Desconocido / Otros': 180 Olivetti + 120 Objetos + 100 Fondos/Paredes (400 muestras)
     id_desconocido = max(dict_identidades.keys()) + 1 if dict_identidades else 1
     np.random.seed(42)
     idx_oli_e2 = np.random.choice(len(X_olivetti), size=min(180, len(X_olivetti)), replace=False)
@@ -324,7 +344,8 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
 
     X_etapa2 = np.vstack(X_list)
     y_etapa2 = np.concatenate(y_list)
-    print(f"  [BALANCE ETAPA 2] ID 0 ({nombres_clases[0]}): {np.sum(y_etapa2 == 0)} | Desconocido / Otros: {np.sum(y_etapa2 == id_desconocido)} (Balance 50/50 estricto: 400 vs 400).")
+    resumen_clases = " | ".join(f"{nombres_clases[c]}: {np.sum(y_etapa2 == c)}" for c in sorted(nombres_clases.keys()))
+    print(f"  [BALANCE ETAPA 2 MULTICLASE] {resumen_clases}")
 
     return X_etapa2, y_etapa2, nombres_clases
 
@@ -523,7 +544,7 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
             from sklearn.neighbors import NearestNeighbors
             nn_poses = NearestNeighbors(n_neighbors=min(8, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
             dists_min_pose, _ = nn_poses.kneighbors(Z_c)
-            radio_pose = float(np.percentile(dists_min_pose[:, -1], 92) * 1.15)
+            radio_pose = float(np.percentile(dists_min_pose[:, -1], 95) * 1.25)
 
             perfiles_identidad[int(c)] = {
                 "centroide": mu_c,
@@ -535,6 +556,16 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
             nom_c = nombres_clases.get(int(c), f"ID {c}") if nombres_clases else f"ID {c}"
             print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f}, Dist media={dist_media:.3f}")
         datos_adicionales["perfiles_identidad"] = perfiles_identidad
+
+        # Umbral de reconstrucción MSE para identidades autorizadas (excluyendo id_desconocido)
+        id_desc = max(perfiles_identidad.keys())
+        mask_autorizados = (y_ent != id_desc)
+        if np.any(mask_autorizados):
+            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent[mask_autorizados], 98) * 1.85))
+        else:
+            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent, 98) * 1.85))
+        datos_adicionales["umbral_mse_identidad"] = umbral_mse_identidad
+        print(f"  [BIOMETRIA] Umbral MSE Identidad Calibrado Dinámicamente: {umbral_mse_identidad:.5f}")
 
     clasificadores = definir_modelos_y_grillas()
     cv_estratificada = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -855,6 +886,10 @@ def main():
         os.path.join(DIR_MODELOS, "etapa2_mejor_modelo.pkl"),
     )
 
+    ids_autorizados = sorted(list(dict_id.keys()))
+    id_desconocido = max(ids_autorizados) + 1 if ids_autorizados else 1
+    umbral_mse_identidad = datos_e2.get("umbral_mse_identidad", 0.0040)
+
     # Guardar metadatos y mapeos
     metadata = {
         "nombres_e1": nombres_e1,
@@ -864,8 +899,12 @@ def main():
         "umbral_confianza_acceso": 0.62,
         "umbral_mse_rostro": datos_e1.get("umbral_mse_rostro", 0.0042),
         "perfiles_identidad": datos_e2.get("perfiles_identidad", {}),
+        "ids_autorizados": ids_autorizados,
+        "id_desconocido": int(id_desconocido),
+        "umbral_mse_identidad": umbral_mse_identidad,
     }
     joblib.dump(metadata, os.path.join(DIR_MODELOS, "metadata_clases.pkl"))
+    print(f"[OK] Metadatos guardados: {len(ids_autorizados)} autorizados ({ids_autorizados}), Desconocido={id_desconocido}, Umbral MSE ID={umbral_mse_identidad:.5f}")
     print("[OK] Todos los artefactos .pkl han sido serializados exitosamente.")
 
     print("\n" + "=" * 80)
