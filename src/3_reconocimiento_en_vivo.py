@@ -25,6 +25,8 @@ from utils_pdi import (
     ScalerPreservandoVarianza,
     extraer_descriptor_espacial_bloques,
     centrar_ventana_en_rostro_pdi,
+    extraer_mapas_convolucionales_2d,
+    cv2_imwrite_unicode,
 )
 
 # Registrar en __main__ para deserialización sin fricción de artefactos serializados con joblib
@@ -32,6 +34,7 @@ setattr(sys.modules["__main__"], "ScalerPreservandoVarianza", ScalerPreservandoV
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR_MODELOS = os.path.join(BASE_DIR, "modelos_entrenados")
+DIR_CLASE_0 = os.path.join(BASE_DIR, "data", "dataset_procesado_64x64", "clase_0_no_persona")
 
 def limpiar_texto_cv2(texto: str) -> str:
     """Remueve tildes y caracteres no ASCII para evitar símbolos '?' en fuentes de OpenCV."""
@@ -53,6 +56,7 @@ NOMBRE_MODELOS_TECLAS = {
     ord("3"): "Random Forest",
     ord("4"): "SVM",
     ord("5"): "ANN (MLP)",
+    ord("6"): "CNN (Deep Learning)",
 }
 
 
@@ -87,6 +91,16 @@ def cargar_artefactos():
 
     metadata = joblib.load(os.path.join(DIR_MODELOS, "metadata_clases.pkl"))
 
+    # Cargar CNN de la Fase Posterior si existe
+    ruta_cnn = os.path.join(DIR_MODELOS, "etapa2_cnn_profunda.pkl")
+    modelo_cnn = None
+    if os.path.exists(ruta_cnn):
+        try:
+            modelo_cnn = joblib.load(ruta_cnn)
+            print("[INFO] Modelo CNN (Deep Learning) cargado para inferencia en tiempo real.")
+        except Exception as e:
+            print(f"[AVISO] No se pudo cargar etapa2_cnn_profunda.pkl: {e}")
+
     return {
         "pca_e1": pca_e1,
         "modelos_e1": modelos_e1,
@@ -96,6 +110,7 @@ def cargar_artefactos():
         "modelos_e2": modelos_e2,
         "mejor_e2_nombre": mejor_e2["nombre"],
         "mejor_e2_info": mejor_e2["info"],
+        "modelo_cnn": modelo_cnn,
         "metadata": metadata,
     }
 
@@ -103,7 +118,7 @@ def cargar_artefactos():
 def extraer_vector_caracteristicas_vivo(pca_model, vector_4096: np.ndarray, scaler=None):
     """
     Aplica la proyección PCA y concatenación de MSE + descriptores PDI biométricos en tiempo real:
-        f = [z_PCA, MSE, Sim_Adaptable, Ratio_HV] ∈ R^(K+3)
+        f = [z_PCA, MSE, Sim_Adaptable, Ratio_HV, Descriptores_Bloques]
     Invariante a giro de cabeza (frente, medio perfil y perfil).
     """
     x = vector_4096.reshape(1, -1)
@@ -203,14 +218,14 @@ def dibujar_panel_actuador(
         f"{texto_modelo}",
         (15, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.52,
         (0, 255, 255),
         2,
     )
 
-    y_offset += 35
+    y_offset += 32
     cv2.line(panel, (15, y_offset), (panel_w - 15, y_offset), (70, 70, 70), 1)
-    y_offset += 20
+    y_offset += 18
 
     # 2. Telemetría de Percepción (Etapa 1 y Etapa 2)
     cv2.putText(panel, "TELEMETRIA DE PERCEPCION:", (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
@@ -222,17 +237,17 @@ def dibujar_panel_actuador(
         f"Etapa 1: {limpiar_texto_cv2(telemetria['estado_e1'])}",
         (15, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
+        0.44,
         color_e1,
         1,
     )
-    y_offset += 20
+    y_offset += 19
     cv2.putText(
         panel,
         f"  MSE Rec: {telemetria['mse']:.5f}",
         (15, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
+        0.40,
         (180, 180, 180),
         1,
     )
@@ -249,33 +264,33 @@ def dibujar_panel_actuador(
         f"Etapa 2: {nombre_e2_txt}",
         (15, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
+        0.46,
         color_e2,
         2,
     )
-    y_offset += 20
+    y_offset += 19
     cv2.putText(
         panel,
         f"  Confianza: {telemetria['confianza'] * 100:.1f}%",
         (15, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
+        0.40,
         (180, 180, 180),
         1,
     )
 
-    y_offset += 30
+    y_offset += 28
     cv2.line(panel, (15, y_offset), (panel_w - 15, y_offset), (70, 70, 70), 1)
-    y_offset += 20
+    y_offset += 18
 
     # 3. Simulación Gráfica del Actuador Físico (Puerta / Cortina)
     cv2.putText(panel, "ESTADO DEL ACTUADOR FISICO:", (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-    y_offset += 25
+    y_offset += 22
 
     puerta_x1 = 30
     puerta_x2 = panel_w - 30
     puerta_y1 = y_offset
-    puerta_h = 85  # Ajustado para no solapar el cuadro de teclas inferior
+    puerta_h = 75
     puerta_y2 = y_offset + puerta_h
     puerta_w = puerta_x2 - puerta_x1
 
@@ -284,7 +299,7 @@ def dibujar_panel_actuador(
     # Fondo interior iluminado
     cv2.rectangle(panel, (puerta_x1, puerta_y1), (puerta_x2, puerta_y2), (30, 80, 40) if telemetria["autorizado"] else (40, 20, 20), -1)
 
-    # Hojas de la puerta corrediza abriéndose proporcionalmente a progreso_apertura [0.0 a 1.0]
+    # Hojas de la puerta corrediza
     hoja_ancho = (puerta_w // 2)
     desplazamiento = int(hoja_ancho * progreso_apertura)
 
@@ -320,8 +335,7 @@ def dibujar_panel_actuador(
         2,
     )
 
-    # Manija o indicador de estado
-    y_offset = puerta_y2 + 18
+    y_offset = puerta_y2 + 16
     color_texto_act = (0, 255, 0) if estado_puerta == "ABIERTA" else (0, 0, 255)
     icono_puerta = "[PUERTA ABIERTA]" if estado_puerta == "ABIERTA" else "[PUERTA CERRADA]"
     cv2.putText(
@@ -329,22 +343,22 @@ def dibujar_panel_actuador(
         f"{icono_puerta}",
         (puerta_x1 + 10, y_offset),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
+        0.50,
         color_texto_act,
         2,
     )
 
-    y_offset += 24
-    # Acceso concedido o denegado
+    y_offset += 22
     texto_acceso = "ACCESO CONCEDIDO" if telemetria["autorizado"] else "ACCESO DENEGADO"
-    cv2.putText(panel, texto_acceso, (puerta_x1 + 15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color_texto_act, 2)
+    cv2.putText(panel, texto_acceso, (puerta_x1 + 15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color_texto_act, 2)
 
     # 4. Ayuda de Teclas en la parte inferior
-    cv2.rectangle(panel, (10, panel_h - 110), (panel_w - 10, panel_h - 10), (20, 20, 20), -1)
-    cv2.putText(panel, "SELECTOR DE ALGORITMOS (TECLADO):", (15, panel_h - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
-    cv2.putText(panel, "[0] Optimo  [1] k-NN  [2] Arbol (DT)", (15, panel_h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1)
-    cv2.putText(panel, "[3] RF      [4] SVM   [5] ANN (MLP)", (15, panel_h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1)
-    cv2.putText(panel, "[Q / ESC] Salir", (15, panel_h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 120, 120), 1)
+    cv2.rectangle(panel, (10, panel_h - 128), (panel_w - 10, panel_h - 8), (20, 20, 20), -1)
+    cv2.putText(panel, "SELECTOR DE ALGORITMOS (TECLADO):", (15, panel_h - 108), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
+    cv2.putText(panel, "[0] Optimo  [1] k-NN  [2] Arbol (DT)", (15, panel_h - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    cv2.putText(panel, "[3] RF      [4] SVM   [5] ANN (MLP)", (15, panel_h - 72), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    cv2.putText(panel, "[6] CNN (2D) [B] Fondo [C] Calib [N] Bloq", (15, panel_h - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 255, 200), 1)
+    cv2.putText(panel, "[Q / ESC] Salir", (15, panel_h - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
 
     return panel
 
@@ -363,6 +377,7 @@ def ejecutar_demostracion():
     modelos_e1 = artefactos["modelos_e1"]
     pca_e2 = artefactos["pca_e2"]
     modelos_e2 = artefactos["modelos_e2"]
+    modelo_cnn = artefactos["modelo_cnn"]
     metadata = artefactos["metadata"]
 
     nombres_e2 = metadata["nombres_e2"]
@@ -373,9 +388,19 @@ def ejecutar_demostracion():
     id_desconocido = metadata.get("id_desconocido", max(nombres_e2.keys()) if nombres_e2 else 1)
     perfiles = metadata.get("perfiles_identidad", {})
     umbral_mse_id = metadata.get("umbral_mse_identidad", 0.0040)
-    umbral_conf = metadata.get("umbral_confianza_acceso", 0.65)
+    umbral_conf = metadata.get("umbral_confianza_acceso", 0.62)
 
     modelo_fuerza = None  # None significa Modo Óptimo Automático
+
+    # Variables de Calibración Rápida para el Día de la Presentación
+    gris_fondo_escena = None
+    ruta_negativos_pkl = os.path.join(DIR_MODELOS, "negativos_vivo_pca.pkl")
+    lista_negativos_vivo = []
+    if os.path.exists(ruta_negativos_pkl):
+        try:
+            lista_negativos_vivo = joblib.load(ruta_negativos_pkl)
+        except Exception:
+            lista_negativos_vivo = []
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -387,12 +412,18 @@ def ejecutar_demostracion():
         cap.read()
 
     BUFFER_FRAMES = 6
-    buffer_verificacion = []  # Almacena tuplas (pred_id, conf) durante los fotogramas válidos
-    progreso_apertura = 0.0  # 0.0 cerrado, 1.0 completamente abierta
+    buffer_verificacion = []
+    progreso_apertura = 0.0
 
     print("\nCámara web iniciada satisfactoriamente.")
-    print("Use las teclas [0] a [5] para conmutar modelos en caliente según las preguntas del docente.")
+    print("Use las teclas [0] a [6] para conmutar modelos en caliente según las preguntas del docente.")
+    print("Teclas de Calibración: [B] Fondo Aula | [C] Luz Rostro | [N] Bloquear Objeto")
     print("Presione [Q] o [ESC] para salir.\n")
+
+    ultimo_z_e2_raw = None
+    ultimo_pred_id = None
+    ultimo_vec_4096 = None
+    ultimo_img_64 = None
 
     while True:
         ret, frame = cap.read()
@@ -404,7 +435,6 @@ def ejecutar_demostracion():
         H, W = frame.shape[:2]
 
         # RECUADRO VISUAL 100% FIJO Y CENTRADO EN PANTALLA (factor_central=0.40)
-        # Idéntico a 1_adquisicion_datos.py: jamás se desplaza, esquiva objetos ni se desalinea
         cuadrado_base, _ = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.40)
         qx, qy, qlado, _ = cuadrado_base
         parche = frame[qy : qy + qlado, qx : qx + qlado]
@@ -415,7 +445,7 @@ def ejecutar_demostracion():
         cx = int(qx + cx_l)
         cy = int(qy + cy_l)
 
-        # Silueta anatómica punteada guía de rostro dentro del recuadro
+        # Silueta anatómica guía dentro del recuadro
         cv2.ellipse(
             frame,
             (qx + qlado // 2, qy + qlado // 2),
@@ -428,12 +458,14 @@ def ejecutar_demostracion():
             cv2.LINE_AA,
         )
 
+        nombre_activo_ui = (
+            f"Optimo Automatico ({artefactos['mejor_e2_nombre']})"
+            if modelo_fuerza is None
+            else f"Forzado: {modelo_fuerza}"
+        )
+
         telemetria = {
-            "modelo_activo": (
-                f"Optimo Automatico ({artefactos['mejor_e2_nombre']})"
-                if modelo_fuerza is None
-                else f"Forzado: {modelo_fuerza}"
-            ),
+            "modelo_activo": nombre_activo_ui,
             "es_humano": False,
             "estado_e1": "Evaluando...",
             "mse": 0.0,
@@ -442,17 +474,31 @@ def ejecutar_demostracion():
             "autorizado": False,
         }
 
-        color_cuadro = (0, 255, 255)  # Amarillo inicial
+        color_cuadro = (0, 255, 255)
         etiqueta_texto = ""
 
         if parche.shape[0] >= 32 and parche.shape[1] >= 32:
             img_64, vec_4096 = preprocesar_ventana_64x64(parche)
+            ultimo_vec_4096 = vec_4096
+            ultimo_img_64 = img_64
+
+            # Validación de calibración de fondo del aula (Tecla [B])
+            rechazo_por_fondo = False
+            if gris_fondo_escena is not None:
+                gris_act_64 = cv2.resize(cv2.cvtColor(parche, cv2.COLOR_BGR2GRAY), (64, 64)).astype(np.float64) / 255.0
+                diff_fondo = float(np.mean(np.abs(gris_act_64 - gris_fondo_escena)))
+                if diff_fondo < 0.060:
+                    rechazo_por_fondo = True
 
             # Filtro 1: Validación PDI Estructural sobre parche en posición fija (0, 0)
             es_humano_candidato, met_pdi = verificar_estructura_facial_pdi(parche, img_64)
 
+            if rechazo_por_fondo:
+                es_humano_candidato = False
+                met_pdi = {"motivo_rechazo": "Fondo de escena vacio", "sim_bilateral": 0.0}
+
             # Si (0, 0) falla por un leve desfase lateral/vertical, verificar si algún desplazamiento corto cumple
-            if not es_humano_candidato:
+            if not es_humano_candidato and not rechazo_por_fondo:
                 for dx_c, dy_c in [(-10, 0), (10, 0), (0, -8), (0, 8)]:
                     y_c = int(np.clip(qy + dy_c, 0, H - qlado))
                     x_c = int(np.clip(qx + dx_c, 0, W - qlado))
@@ -467,7 +513,7 @@ def ejecutar_demostracion():
                             break
 
             # Determinar clasificador activo para Etapa 1
-            if modelo_fuerza is None:
+            if modelo_fuerza is None or modelo_fuerza == "CNN (Deep Learning)":
                 mod_e1_obj = artefactos["mejor_e1_info"]["modelo"]
                 scaler_e1 = artefactos["mejor_e1_info"]["scaler"]
             else:
@@ -484,6 +530,14 @@ def ejecutar_demostracion():
             # Forzar pred_e1 = 1 si es humano candidato por PDI y cumple subespacio
             if es_humano_candidato and mse_val <= umbral_mse:
                 pred_e1 = 1
+
+            # Validación contra objetos bloqueados en vivo (Tecla [N])
+            if lista_negativos_vivo and es_humano_candidato:
+                z_neg_cand = pca_e2.transform(vec_4096.reshape(1, -1))[0]
+                dist_min_neg = min(float(np.linalg.norm(z_neg_cand - zn)) for zn in lista_negativos_vivo)
+                if dist_min_neg < 4.5:
+                    es_humano_candidato = False
+                    met_pdi = {"motivo_rechazo": "Objeto bloqueado en vivo", "sim_bilateral": 0.0}
 
             if (not es_humano_candidato) or (pred_e1 == 0) or (mse_val > umbral_mse):
                 buffer_verificacion.clear()
@@ -537,11 +591,15 @@ def ejecutar_demostracion():
                                     mejor_vec_4096 = v_cand
 
                 vec_4096 = mejor_vec_4096
+                ultimo_vec_4096 = vec_4096
 
                 # Determinar clasificador activo para Etapa 2
                 if modelo_fuerza is None:
                     mod_e2_obj = artefactos["mejor_e2_info"]["modelo"]
                     scaler_e2 = artefactos["mejor_e2_info"]["scaler"]
+                elif modelo_fuerza == "CNN (Deep Learning)":
+                    mod_e2_obj = None
+                    scaler_e2 = None
                 else:
                     mod_e2_obj = modelos_e2[modelo_fuerza]["modelo"]
                     scaler_e2 = modelos_e2[modelo_fuerza]["scaler"]
@@ -549,7 +607,19 @@ def ejecutar_demostracion():
                 f_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
                 num_clases_totales = max(nombres_e2.keys()) + 1
 
-                if modelo_fuerza is None:
+                if modelo_fuerza == "CNN (Deep Learning)":
+                    if modelo_cnn is not None:
+                        clf_cnn = modelo_cnn["modelo"]
+                        scaler_cnn = modelo_cnn["scaler"]
+                        f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
+                        f_conv_s = scaler_cnn.transform(f_conv)
+                        v_p = obtener_vector_probabilidades(clf_cnn, f_conv_s, num_clases_totales)
+                        pred_id = int(np.argmax(v_p))
+                        prob_pred = float(np.max(v_p))
+                    else:
+                        pred_id = int(artefactos["mejor_e2_info"]["modelo"].predict(f_e2)[0])
+                        prob_pred = 0.85
+                elif modelo_fuerza is None:
                     # Modo Óptimo Automático: promediar vectores de probabilidad
                     lista_probas = []
                     for nom_cand in ["SVM", "Random Forest", "ANN (MLP)", "k-NN"]:
@@ -558,6 +628,19 @@ def ejecutar_demostracion():
                             f_cand, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_cand)
                             v_p = obtener_vector_probabilidades(modelos_e2[nom_cand]["modelo"], f_cand, num_clases_totales)
                             lista_probas.append(v_p)
+
+                    # Incluir también el voto de la CNN si está disponible
+                    if modelo_cnn is not None:
+                        try:
+                            clf_cnn = modelo_cnn["modelo"]
+                            scaler_cnn = modelo_cnn["scaler"]
+                            f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
+                            f_conv_s = scaler_cnn.transform(f_conv)
+                            v_cnn = obtener_vector_probabilidades(clf_cnn, f_conv_s, num_clases_totales)
+                            lista_probas.append(v_cnn)
+                        except Exception:
+                            pass
+
                     if lista_probas:
                         probas_promedio = np.mean(lista_probas, axis=0)
                         pred_id = int(np.argmax(probas_promedio))
@@ -572,6 +655,8 @@ def ejecutar_demostracion():
 
                 # Verificación Biométrica Dinámica en Subespacio PCA para la clase predicha pred_id
                 z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
+                ultimo_z_e2_raw = z_e2_raw
+                ultimo_pred_id = pred_id
 
                 if pred_id in ids_autorizados and pred_id in perfiles:
                     perfil_cand = perfiles[pred_id]
@@ -586,7 +671,7 @@ def ejecutar_demostracion():
                     conf_geom = float(np.exp(-0.35 * (ratio_d ** 2)))
                     conf_frame = float(np.clip(0.55 * prob_pred + 0.45 * conf_geom, 0.10, 0.97))
 
-                    if ratio_d <= 1.20 and mse_e2 <= max(0.0040, umbral_mse_id) and conf_frame >= 0.58:
+                    if ratio_d <= 1.18 and mse_e2 <= max(0.0040, umbral_mse_id) and conf_frame >= 0.58:
                         pred_id_frame = pred_id
                     else:
                         pred_id_frame = id_desconocido
@@ -601,7 +686,7 @@ def ejecutar_demostracion():
                 if len(buffer_verificacion) < BUFFER_FRAMES:
                     progreso_pct = int((len(buffer_verificacion) / float(BUFFER_FRAMES)) * 100)
                     telemetria["autorizado"] = False
-                    color_cuadro = (0, 220, 255)  # Amarillo / Cian de análisis
+                    color_cuadro = (0, 220, 255)
                     etiqueta_texto = f"ANALIZANDO ROSTRO... [{progreso_pct}%]"
                     telemetria["identidad_nombre"] = "Analizando biometria..."
                     telemetria["confianza"] = float(len(buffer_verificacion) / float(BUFFER_FRAMES))
@@ -617,18 +702,18 @@ def ejecutar_demostracion():
                     if id_ganador in ids_autorizados:
                         nombre_persona = nombres_e2.get(id_ganador, f"ID {id_ganador}")
                         telemetria["autorizado"] = True
-                        color_cuadro = (0, 255, 0)  # Verde brillante
+                        color_cuadro = (0, 255, 0)
                         etiqueta_texto = f"{nombre_persona} ({conf_final*100:.0f}%) [AUTORIZADO]"
                         telemetria["identidad_nombre"] = nombre_persona
                         telemetria["confianza"] = conf_final
                     else:
                         telemetria["autorizado"] = False
-                        color_cuadro = (0, 0, 255)  # Rojo
+                        color_cuadro = (0, 0, 255)
                         etiqueta_texto = f"[NO AUTORIZADO: Desconocido] ({conf_final*100:.0f}%)"
                         telemetria["identidad_nombre"] = "Desconocido (No Registrado)"
                         telemetria["confianza"] = conf_final
 
-        # Dibujar cuadrado envolvente y centroide real en la vista de cámara (sin sobrescribir centroide)
+        # Dibujar cuadrado envolvente y centroide real en la vista de cámara
         cv2.rectangle(frame, (qx, qy), (qx + qlado, qy + qlado), color_cuadro, 2)
         cv2.circle(frame, (cx, cy), 4, color_cuadro, -1)
         if etiqueta_texto:
@@ -669,6 +754,36 @@ def ejecutar_demostracion():
             modelo_fuerza = None
             buffer_verificacion.clear()
             print(">>> Conmutado a Modo Óptimo Automático")
+        elif tecla in [ord("b"), ord("B")]:
+            gris_fondo_escena = cv2.resize(cv2.cvtColor(parche, cv2.COLOR_BGR2GRAY), (64, 64)).astype(np.float64) / 255.0
+            buffer_verificacion.clear()
+            print("[CALIBRACIÓN] Fondo del aula capturado y registrado con éxito con la tecla [B].")
+        elif tecla in [ord("c"), ord("C")]:
+            if ultimo_z_e2_raw is not None:
+                target_id = ultimo_pred_id if (ultimo_pred_id in ids_autorizados) else (ids_autorizados[0] if ids_autorizados else 0)
+                if target_id in perfiles:
+                    z_flip = pca_e2.transform(np.fliplr(ultimo_img_64).reshape(1, -1))[0]
+                    mat_p = perfiles[target_id].get("matriz_Z_poses", None)
+                    if mat_p is not None and len(mat_p) > 0:
+                        perfiles[target_id]["matriz_Z_poses"] = np.vstack([mat_p, ultimo_z_e2_raw, z_flip])
+                    else:
+                        perfiles[target_id]["matriz_Z_poses"] = np.array([ultimo_z_e2_raw, z_flip])
+                    nom_calib = nombres_e2.get(target_id, f"ID {target_id}")
+                    print(f"[CALIBRACIÓN] Luz del aula calibrada: vector facial agregado a matriz_Z_poses de {nom_calib} con tecla [C].")
+        elif tecla in [ord("n"), ord("N")]:
+            # Guardar imagen en clase_0_no_persona y agregar vector negativo
+            if ultimo_img_64 is not None:
+                ruta_neg_img = os.path.join(DIR_CLASE_0, f"objeto_manual_vivo_{int(time.time()*1000)}.png")
+                cv2_imwrite_unicode(ruta_neg_img, (ultimo_img_64 * 255.0).astype(np.uint8))
+            if ultimo_vec_4096 is not None:
+                z_neg = pca_e2.transform(ultimo_vec_4096.reshape(1, -1))[0]
+                lista_negativos_vivo.append(z_neg)
+                try:
+                    joblib.dump(lista_negativos_vivo, ruta_negativos_pkl)
+                except Exception:
+                    pass
+            buffer_verificacion.clear()
+            print(f"[CALIBRACIÓN] Objeto bloqueado en vivo y guardado en clase_0_no_persona con tecla [N].")
         elif tecla in NOMBRE_MODELOS_TECLAS:
             modelo_fuerza = NOMBRE_MODELOS_TECLAS[tecla]
             buffer_verificacion.clear()

@@ -90,10 +90,10 @@ def cargar_dataset_completo():
 
     # 3. Cargar imágenes reales de la carpeta clase_0_no_persona (balanceando fondos y objetos)
     archivos_fondo = glob.glob(os.path.join(DIR_CLASE_0, "*.png"))
-    archivos_obj = [f for f in archivos_fondo if "objeto" in os.path.basename(f)]
-    archivos_wall = [f for f in archivos_fondo if "objeto" not in os.path.basename(f)]
+    archivos_obj = [f for f in archivos_fondo if os.path.basename(f).startswith("objeto_")]
+    archivos_wall = [f for f in archivos_fondo if not os.path.basename(f).startswith("objeto_")]
 
-    # Cargar TODOS los objetos reales (vela, botella, control, celular)
+    # Cargar TODOS los objetos reales (incluyendo objeto_manual_*.png recién capturados con la tecla [F])
     X_obj_local = []
     for f in archivos_obj:
         im = cv2_imread_unicode(f, cv2.IMREAD_GRAYSCALE)
@@ -104,7 +104,7 @@ def cargar_dataset_completo():
             im_mask = aplicar_mascara_eliptica_a_img64(im_double)
             X_obj_local.append(im_mask.reshape(-1))
 
-    # Cargar hasta 250 fondos/paredes
+    # Cargar hasta 250 fondos/paredes reales
     np.random.seed(42)
     n_wall = min(len(archivos_wall), 250)
     idx_w = np.random.choice(len(archivos_wall), size=n_wall, replace=False) if len(archivos_wall) > 0 else []
@@ -118,7 +118,7 @@ def cargar_dataset_completo():
             im_mask = aplicar_mascara_eliptica_a_img64(im_double)
             X_wall_local.append(im_mask.reshape(-1))
 
-    print(f"  [DATOS REALES] Clase 0 cargada: {len(X_obj_local)} objetos reales + {len(X_wall_local)} fondos/paredes.")
+    print(f"  [DATOS REALES] Clase 0 cargada: {len(X_obj_local)} objetos reales (todos) + {len(X_wall_local)} fondos/paredes (hasta 250).")
 
     # 4. Descubrimiento dinámico de identidades reales en data/dataset_procesado_64x64/ (mínimo 15 fotos)
     dict_identidades = {}
@@ -561,9 +561,9 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
         id_desc = max(perfiles_identidad.keys())
         mask_autorizados = (y_ent != id_desc)
         if np.any(mask_autorizados):
-            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent[mask_autorizados], 98) * 1.85))
+            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent[mask_autorizados], 96) * 1.35))
         else:
-            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent, 98) * 1.85))
+            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent, 96) * 1.35))
         datos_adicionales["umbral_mse_identidad"] = umbral_mse_identidad
         print(f"  [BIOMETRIA] Umbral MSE Identidad Calibrado Dinámicamente: {umbral_mse_identidad:.5f}")
 

@@ -257,9 +257,18 @@ def aplicar_mascara_eliptica_a_img64(img_64_double: np.ndarray) -> np.ndarray:
     Aplica la máscara elíptica facial suave a una imagen de 64x64 en [0.0, 1.0]
     preservando intacto el contraste real del interior del rostro y neutralizando
     únicamente las 4 esquinas exteriores fuera de la elipse con un tono neutro (0.42).
+    Aplica normalización fotométrica intra-elipse si std_int > 0.045 para homogeneidad.
     """
     mascara = obtener_mascara_eliptica_64()
-    img_enmascarada = img_64_double * mascara + 0.42 * (1.0 - mascara)
+    region_interna = mascara > 0.5
+    vals_internos = img_64_double[region_interna]
+    std_int = float(np.std(vals_internos))
+    img_base = img_64_double.copy()
+    if std_int > 0.045:
+        media_int = float(np.mean(vals_internos))
+        img_norm = (img_base - media_int) * (0.18 / (std_int + 1e-6)) + 0.48
+        img_base = np.clip(img_norm, 0.0, 1.0)
+    img_enmascarada = img_base * mascara + 0.42 * (1.0 - mascara)
     return np.clip(img_enmascarada, 0.0, 1.0)
 
 
@@ -275,7 +284,8 @@ def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
            - Si std_cruda >= 12.0 (rostro real), aplica ecualización balanceada suave (0.6 eq + 0.4 gauss).
         5. Reducción espacial de cátedra por MEDIANA DE BLOQUE VECTORIZADA a 64x64.
         6. Conversión a precisión continua double en [0.0, 1.0].
-        7. Aplicación obligatoria de máscara elíptica suave: elimina el fondo de las esquinas.
+        7. Normalización fotométrica intra-elipse (media 0.48, std 0.18) si std_int > 0.045.
+        8. Aplicación obligatoria de máscara elíptica suave: elimina el fondo de las esquinas.
 
     Retorna:
         - img_64x64_double: Matriz np.ndarray de tamaño (64, 64) en np.float64.
@@ -308,8 +318,17 @@ def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
     # Conversión explícita a double [0.0, 1.0]
     img_64x64_base = np.clip(img_64x64_mediana / 255.0, 0.0, 1.0)
 
-    # Aplicar máscara elíptica facial suave para borrar esquinas y fondo
-    img_64x64_double = aplicar_mascara_eliptica_a_img64(img_64x64_base)
+    # Normalización fotométrica intra-elipse de cátedra
+    mascara = obtener_mascara_eliptica_64()
+    region_interna = mascara > 0.5
+    vals_internos = img_64x64_base[region_interna]
+    std_int = float(np.std(vals_internos))
+    if std_int > 0.045:
+        media_int = float(np.mean(vals_internos))
+        img_norm = (img_64x64_base - media_int) * (0.18 / (std_int + 1e-6)) + 0.48
+        img_64x64_base = np.clip(img_norm, 0.0, 1.0)
+    img_64x64_double = img_64x64_base * mascara + 0.42 * (1.0 - mascara)
+    img_64x64_double = np.clip(img_64x64_double, 0.0, 1.0)
     vector_4096 = img_64x64_double.reshape(-1)
 
     return img_64x64_double, vector_4096
@@ -612,6 +631,56 @@ def extraer_descriptor_espacial_bloques(im_64: np.ndarray) -> np.ndarray:
     return np.array(feats, dtype=np.float64)
 
 
+def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
+    """
+    Bloque Convolucional 2D Auténtico de Cátedra (Para Fase Posterior CNN e Inferencia en Vivo):
+    Aplica 6 kernels 2D (3x3): Sobel H, Sobel V, Pasa-Altos de Cátedra, High-Boost Centro 9,
+    Diagonal Principal y Diagonal Secundaria.
+    Para cada kernel:
+      1. Convolución 2D con cv2.filter2D(img, cv2.CV_64F, k)
+      2. Activación no lineal ReLU: relu = np.maximum(0.0, conv)
+      3. Max-Pooling 2D auténtico de 4x4 (reduce 64x64 a 16x16 tomando el máximo real del bloque,
+         lo que otorga invariancia a traslación espacial).
+    Además, extrae Average-Pooling 2D de 8x8 de la imagen directa (reduce 64x64 a 8x8 capturando la estructura global).
+    Concatena los 6 mapas Max-Pool (6 * 256 = 1536) + Average-Pool (64) = 1600 características convolucionales 2D.
+    """
+    if imagenes_64x64.ndim == 2:
+        imgs = imagenes_64x64.reshape(1, 64, 64)
+    elif imagenes_64x64.ndim == 3:
+        imgs = imagenes_64x64
+    else:
+        imgs = imagenes_64x64.reshape(-1, 64, 64)
+
+    k_sh = np.array([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=np.float64)
+    k_sv = np.array([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=np.float64)
+    k_pa = np.array([[-1.0, -1.0, -1.0], [-1.0, 8.0, -1.0], [-1.0, -1.0, -1.0]], dtype=np.float64) / 8.0
+    k_hb = np.array([[-1.0, -1.0, -1.0], [-1.0, 9.0, -1.0], [-1.0, -1.0, -1.0]], dtype=np.float64) / 9.0
+    k_dp = np.array([[2.0, -1.0, -1.0], [-1.0, 2.0, -1.0], [-1.0, -1.0, 2.0]], dtype=np.float64) / 4.0
+    k_ds = np.array([[-1.0, -1.0, 2.0], [-1.0, 2.0, -1.0], [2.0, -1.0, -1.0]], dtype=np.float64) / 4.0
+
+    kernels = [k_sh, k_sv, k_pa, k_hb, k_dp, k_ds]
+    N = len(imgs)
+    F_conv = np.empty((N, 1600), dtype=np.float64)
+
+    for i in range(N):
+        im = imgs[i].astype(np.float64)
+        mapas_pool = []
+        for k in kernels:
+            conv = cv2.filter2D(im, cv2.CV_64F, k)
+            relu = np.maximum(0.0, conv)
+            # Max-Pooling 2D auténtico por bloques 4x4
+            pool_max = relu.reshape(16, 4, 16, 4).max(axis=(1, 3)).reshape(-1)
+            mapas_pool.append(pool_max)
+
+        # Average-Pooling 2D por bloques 8x8
+        pool_avg = im.reshape(8, 8, 8, 8).mean(axis=(1, 3)).reshape(-1)
+        mapas_pool.append(pool_avg)
+
+        F_conv[i] = np.concatenate(mapas_pool)
+
+    return F_conv
+
+
 def aumentar_geometria_rostro(im_64: np.ndarray, dx=0, dy=0, scale=1.0, flip=False) -> np.ndarray:
     """
     Aplica traslación (dx, dy), escala (zoom) y/o espejado horizontal sobre una imagen de 64x64
@@ -691,7 +760,7 @@ def centrar_ventana_en_rostro_pdi(frame_bgr: np.ndarray, cuadrado_base: list, ma
 
 def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.ndarray):
     """
-    Validación Biométrica PDI de Anatomía Facial Humana Universal (Etapa 1):
+    Validación Antropométrica Universal en Zona-T y PDI Estructural (Etapa 1):
     Evalúa características anatómicas universales de un rostro humano (cualquier hombre o mujer,
     con flequillo o frente despejada) y bloquea objetos inanimados (botellas, perfumes,
     puños/manos, muñecos de plástico y paredes vacías).
@@ -721,46 +790,66 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     bw_croma = ((G - R) > 0.04) | ((B - R) > 0.05)
     corona_blanca = float(np.mean((gris[4:20, 16:48] > 0.80) & (np.abs(R - B)[4:20, 16:48] < 0.08)))
     if float(np.mean(bw_croma[14:48, 14:50])) > 0.08 or corona_blanca > 0.28:
-        return False, {"motivo_rechazo": "Color artificial (Botella/Muneco/Objeto)", "sim_bilateral": 0.0}
+        return False, {"motivo_rechazo": "Color artificial (Vela/Objeto)", "sim_bilateral": 0.0}
 
     # 2. Ausencia de bloques negros en el centro facial [22:48, 18:46] (bloquea perfumes o controles)
     if float(np.mean(gris_n[22:48, 18:46] < 0.18)) > 0.26:
         return False, {"motivo_rechazo": "Objeto oscuro en el centro", "sim_bilateral": 0.0}
 
-    # 3. Anatomía Humana Universal:
-    # Mediana de referencia en zona de mejillas
+    # 3. Bloqueo de líneas verticales continuas de puertas/paredes (corr_vertical_pared):
+    perfil_sup = np.mean(gris[6:16, 12:52], axis=0)
+    perfil_med = np.mean(gris[20:30, 12:52], axis=0)
+    std_ps = float(np.std(perfil_sup))
+    std_pm = float(np.std(perfil_med))
+    if std_ps > 1e-4 and std_pm > 1e-4:
+        c_mat = np.corrcoef(perfil_sup, perfil_med)
+        corr_v = float(c_mat[0, 1]) if not np.isnan(c_mat[0, 1]) else 0.0
+        if corr_v > 0.91:
+            return False, {"motivo_rechazo": "Estructura vertical continua (Puerta/Pared)", "sim_bilateral": 0.0}
+
+    # 4. Validación estricta de las dos cajas oculares superiores gris[12:32, 14:30] y gris[12:32, 34:50]:
+    gris_crudo_255 = gris * 255.0
+    std_ojo_izq = float(np.std(gris_crudo_255[12:32, 14:30]))
+    std_ojo_der = float(np.std(gris_crudo_255[12:32, 34:50]))
+    if min(std_ojo_izq, std_ojo_der) < 7.8:
+        return False, {"motivo_rechazo": "Sin textura ocular bilateral (Pared/Objeto)", "sim_bilateral": 0.0}
+
+    ojo_izq_n = gris_n[12:32, 14:30]
+    ojo_der_n = gris_n[12:32, 34:50]
+    gy_izq = float(np.mean(np.abs(cv2.Sobel(ojo_izq_n, cv2.CV_64F, 0, 1, ksize=3))))
+    gx_izq = float(np.mean(np.abs(cv2.Sobel(ojo_izq_n, cv2.CV_64F, 1, 0, ksize=3))))
+    gy_der = float(np.mean(np.abs(cv2.Sobel(ojo_der_n, cv2.CV_64F, 0, 1, ksize=3))))
+    gx_der = float(np.mean(np.abs(cv2.Sobel(ojo_der_n, cv2.CV_64F, 1, 0, ksize=3))))
+    gy_tot = gy_izq + gy_der
+    gx_tot = gx_izq + gx_der
+    if (min(gy_izq, gy_der) < 0.024) or (gy_tot < 0.62 * (gx_tot + 1e-6)):
+        return False, {"motivo_rechazo": "Sin bordes horizontales en ojos (Cejas)", "sim_bilateral": 0.0}
+
     zona_mejillas = gris_n[26:48, 16:48]
     mediana_mejillas = float(np.median(zona_mejillas))
+    p20_izq = float(np.percentile(ojo_izq_n, 20))
+    p20_der = float(np.percentile(ojo_der_n, 20))
+    if (max(p20_izq, p20_der) > mediana_mejillas * 0.88) or (max(p20_izq, p20_der) > 0.47):
+        return False, {"motivo_rechazo": "Sin cuencas oculares sombreadas (Puno/Pared)", "sim_bilateral": 0.0}
 
-    # Cajas oculares [14:33, 14:31] y [14:33, 33:50]: cejas y ojos oscuros con contraste
-    ojo_izq = gris_n[14:33, 14:31]
-    ojo_der = gris_n[14:33, 33:50]
-    p20_izq = float(np.percentile(ojo_izq, 20))
-    p20_der = float(np.percentile(ojo_der, 20))
-    std_izq = float(np.std(ojo_izq)) * 255.0
-    std_der = float(np.std(ojo_der)) * 255.0
-
-    if (min(p20_izq, p20_der) > mediana_mejillas * 0.90) or (min(p20_izq, p20_der) > 0.48) or (min(std_izq, std_der) < 8.0):
-        return False, {"motivo_rechazo": "Sin cuencas oculares/cejas (Puno/Pared)", "sim_bilateral": 0.0}
-
-    # Tercio inferior central [34:54, 20:44]: fosas nasales y labios con gradiente y contraste
+    # 5. Validación de fosas nasales y boca en el tercio inferior [34:54, 20:44]:
     zona_boca = gris_n[34:54, 20:44]
     gy_boca = float(np.mean(np.abs(cv2.Sobel(zona_boca, cv2.CV_64F, 0, 1, ksize=3))))
-    cont_boca = float(np.percentile(zona_boca, 88)) - float(np.percentile(zona_boca, 12))
-    if gy_boca < 0.022 or cont_boca < 0.10:
-        return False, {"motivo_rechazo": "Sin contraste de nariz/labios (Pared/Mano)", "sim_bilateral": 0.0}
+    rango_boca = float(np.percentile(zona_boca, 88)) - float(np.percentile(zona_boca, 12))
+    if gy_boca < 0.023 or rango_boca < 0.10:
+        return False, {"motivo_rechazo": "Sin contraste de nariz/labios (Puno/Mano)", "sim_bilateral": 0.0}
 
-    # Presencia de piel humana bilateral en mejillas [24:48, 14:50] (>= 0.24)
+    # 6. Presencia de piel humana bilateral en mejillas [24:48, 14:50] (>= 0.25)
     bw_piel = (
         (R_n > 0.20) & (G_n > 0.11) & (B_n > 0.07)
         & ((R_n - G_n) >= 0.005) & ((R_n - G_n) <= 0.38)
         & ((R_n - B_n) >= 0.010)
         & (gris_n > 0.20) & (gris_n < 0.88)
     )
-    if float(np.mean(bw_piel[24:48, 14:50])) < 0.24:
+    if float(np.mean(bw_piel[24:48, 14:50])) < 0.25:
         return False, {"motivo_rechazo": "Sin piel facial genuina (Objeto)", "sim_bilateral": 0.0}
 
-    # Simetría bilateral adaptable (columnas 25 a 39 para tolerar giros y desfases leves)
+    # 7. Simetría bilateral adaptable (columnas 25 a 39 para tolerar giros y desfases leves)
     mejor_sim = 0.0
     for cx in range(25, 40, 2):
         w_s = min(cx - 8, 56 - cx)

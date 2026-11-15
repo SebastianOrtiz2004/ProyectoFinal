@@ -7,7 +7,9 @@ Universidad Técnica de Ambato - FISEI - Software
 """
 
 import os
+import sys
 import warnings
+import joblib
 import cv2
 import numpy as np
 import pandas as pd
@@ -15,78 +17,37 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.neural_network import MLPClassifier
-from scipy.signal import correlate2d
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR_MODELOS = os.path.join(BASE_DIR, "modelos_entrenados")
 DIR_FIGURAS = os.path.join(BASE_DIR, "figuras_y_reportes")
 
-
-def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
-    """
-    Bloque Convolucional 2D Modular compatible con cualquier entorno Python:
-    Aplica bancos de filtros espaciales convolucionales (detección de orillas de Sobel,
-    filtros laplacianos, kernels direccionales y filtros de Gabor) seguidos de
-    activación ReLU y Max-Pooling 2D (ventana 2x2, stride 2).
-
-    Demuestra la extracción jerárquica automática de mapas de características convolucionales
-    sobre la matriz bidimensional directa (64x64x1), contrastando frente al subespacio lineal global de PCA.
-    """
-    kernels = [
-        # Sobel Horizontal
-        np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64),
-        # Sobel Vertical
-        np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64),
-        # Laplaciano de orillas
-        np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float64),
-        # Realce diagonal
-        np.array([[2, -1, -1], [-1, 2, -1], [-1, -1, 2]], dtype=np.float64),
-    ]
-
-    N = len(imagenes_64x64)
-    caracteristicas_cnn = []
-
-    for idx in range(N):
-        img = imagenes_64x64[idx]
-        mapas_muestra = []
-
-        for k in kernels:
-            # 1. Operación de Convolución 2D: (I * K)(x, y)
-            conv = correlate2d(img, k, mode="same", boundary="symm")
-            # 2. Función de Activación No Lineal ReLU: f(x) = max(0, x)
-            relu = np.maximum(0.0, conv)
-            # 3. MaxPooling 2D con factor de submuestreo 4x4 (reduce de 64x64 a 16x16)
-            pool = relu[::4, ::4]
-            mapas_muestra.append(pool.reshape(-1))
-
-        # Vector convolucional concatenado
-        vector_conv = np.concatenate(mapas_muestra)
-        caracteristicas_cnn.append(vector_conv)
-
-    return np.array(caracteristicas_cnn, dtype=np.float64)
+sys.path.append(os.path.dirname(__file__))
+from utils_pdi import extraer_mapas_convolucionales_2d
 
 
 def entrenar_evaluar_cnn():
     os.makedirs(DIR_FIGURAS, exist_ok=True)
+    os.makedirs(DIR_MODELOS, exist_ok=True)
     print("=" * 80)
     print("FASE POSTERIOR: RED NEURONAL CONVOLUCIONAL (CNN) vs. PIPELINE CLÁSICO (PCA)")
     print("Universidad Técnica de Ambato - FISEI - Ortiz & Ayuquina")
     print("=" * 80)
 
-    # Cargar datos idénticos de la Etapa 2 (Sebastián vs Desconocido)
-    import sys
-    sys.path.append(os.path.dirname(__file__))
+    # Cargar datos idénticos de la Etapa 2
     import importlib
     modulo_ent = importlib.import_module("2_entrenamiento_evaluacion")
 
-    print("\nCargando datos homogeneizados de la Etapa 2 (Sebastián vs Desconocido)...")
+    print("\nCargando datos homogeneizados de la Etapa 2 (Multiclase de Identidad)...")
     X_oli, y_oli, X_fondo, dict_id, X_obj = modulo_ent.cargar_dataset_completo()
     X_e2, y_e2, nombres_e2 = modulo_ent.construir_matrices_etapa2(X_oli, dict_id, X_obj, X_fondo)
     X_raw = X_e2.reshape(-1, 64, 64).astype(np.float64)
     y = y_e2
 
-    # Dividir estratificadamente 80% train / 20% test
+    # Dividir estratificadamente 80% train / 20% test (idéntico a etapa clásica)
     X_ent, X_pru, y_ent, y_pru = train_test_split(
         X_raw, y, test_size=0.20, stratify=y, random_state=42
     )
@@ -94,26 +55,31 @@ def entrenar_evaluar_cnn():
     print(f"Conjunto de entrenamiento: {X_ent.shape[0]} imágenes de 64x64x1")
     print(f"Conjunto de prueba: {X_pru.shape[0]} imágenes de 64x64x1")
 
-    print("\nAplicando Bloque Convolucional 2D [Conv2D (4 filtros) + ReLU + MaxPool2D]...")
+    print("\nAplicando Bloque Convolucional 2D [6 Filtros + ReLU + MaxPool2D 4x4 + AvgPool2D 8x8]...")
     F_conv_ent = extraer_mapas_convolucionales_2d(X_ent)
     F_conv_pru = extraer_mapas_convolucionales_2d(X_pru)
     print(f"Dimensión del mapa de características convolucional: {F_conv_ent.shape[1]}")
+
+    print("Estandarizando características convolucionales con StandardScaler...")
+    scaler_cnn = StandardScaler()
+    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent)
+    F_conv_pru_s = scaler_cnn.transform(F_conv_pru)
 
     print("Entrenando clasificador denso completamente conectado con regularización L2 y Early Stopping...")
     # Capa Densa Final (Softmax / Cross-Entropy)
     clf_cnn = MLPClassifier(
         hidden_layer_sizes=(128, 64),
         activation="relu",
-        alpha=0.1,  # Regularización anti-overfitting
+        alpha=0.15,  # Regularización anti-overfitting
         max_iter=400,
         early_stopping=True,
         random_state=42,
     )
-    clf_cnn.fit(F_conv_ent, y_ent)
+    clf_cnn.fit(F_conv_ent_s, y_ent)
     print(f"  [ÉPOCAS CNN] Clasificador denso convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas.")
 
-    y_pred_ent = clf_cnn.predict(F_conv_ent)
-    y_pred_pru = clf_cnn.predict(F_conv_pru)
+    y_pred_ent = clf_cnn.predict(F_conv_ent_s)
+    y_pred_pru = clf_cnn.predict(F_conv_pru_s)
 
     acc_ent = accuracy_score(y_ent, y_pred_ent) * 100.0
     err_ent = 100.0 - acc_ent
@@ -124,6 +90,11 @@ def entrenar_evaluar_cnn():
     # Verificación estricta de cátedra
     assert np.isclose(acc_ent + err_ent, 100.0)
     assert np.isclose(acc_pru + err_pru, 100.0)
+
+    # Serializar el modelo CNN entrenado para su uso en tiempo real en 3_reconocimiento_en_vivo.py
+    ruta_modelo_cnn = os.path.join(DIR_MODELOS, "etapa2_cnn_profunda.pkl")
+    joblib.dump({"modelo": clf_cnn, "scaler": scaler_cnn}, ruta_modelo_cnn)
+    print(f"[OK] Modelo CNN serializado exitosamente en: {ruta_modelo_cnn}")
 
     # Cargar tabla previa de la Etapa 2 si existe para comparación directa
     ruta_csv_e2 = os.path.join(DIR_FIGURAS, "tabla_resultados_etapa2_identidad.csv")
