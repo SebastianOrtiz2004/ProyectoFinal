@@ -355,7 +355,7 @@ def ejecutar_demostracion():
     for _ in range(10):
         cap.read()
 
-    BUFFER_FRAMES = 12
+    BUFFER_FRAMES = 6
     buffer_verificacion = []  # Almacena tuplas (pred_id, conf) durante los fotogramas válidos
     progreso_apertura = 0.0  # 0.0 cerrado, 1.0 completamente abierta
     qx_prev, qy_prev = None, None
@@ -376,7 +376,7 @@ def ejecutar_demostracion():
         # EVALUACIÓN DIRECTA POR VENTANA GEOMÉTRICA DE CÁTEDRA CON AUTO-CENTRADO DINÁMICO
         # Recorta exactamente de cejas a mentón y se auto-centra ágilmente sobre el rostro del usuario.
         cuadrado_base, _ = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.38)
-        cuadrado_centrado = centrar_ventana_en_rostro_pdi(frame, cuadrado_base, max_shift=25)
+        cuadrado_centrado = centrar_ventana_en_rostro_pdi(frame, cuadrado_base, max_shift=75)
         qx_t, qy_t, qlado, _ = cuadrado_centrado
 
         # Suavizado exponencial (0.50 / 0.50) para seguimiento ágil y fluido del rostro
@@ -431,6 +431,41 @@ def ejecutar_demostracion():
             # Filtro 1: Validación PDI Estructural (Paredes lisas / Pantallas saturadas / Asimetría)
             es_humano_candidato, met_pdi = verificar_estructura_facial_pdi(parche, img_64)
 
+            # Micro-alineamiento multi-posición ANTES de Etapa 1 y Etapa 2:
+            # Si pasa la validación humana básica o candidato, busca el mejor micro-recorte
+            # entre [(0, 0), (-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6)] (y np.fliplr)
+            # que minimice dist_geo_0 para alinear de forma óptima las facciones faciales.
+            perfil_0 = metadata.get("perfiles_identidad", {}).get(0, None)
+            mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
+
+            if es_humano_candidato and mat_poses_0 is not None:
+                mejor_dist_0 = 1e9
+                mejor_vec_4096 = vec_4096
+                mejor_met_pdi = met_pdi
+
+                for dx_s, dy_s in [(0, 0), (-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6)]:
+                    y_s = int(np.clip(qy + dy_s, 0, H - qlado))
+                    x_s = int(np.clip(qx + dx_s, 0, W - qlado))
+                    parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
+                    if parche_s.shape[0] == qlado and parche_s.shape[1] == qlado:
+                        img_s, v_s = preprocesar_ventana_64x64(parche_s)
+                        cands = [
+                            (img_s, v_s, parche_s),
+                            (np.fliplr(img_s), np.fliplr(img_s).reshape(-1), parche_s),
+                        ]
+                        for i_c, v_c, p_c in cands:
+                            z_c = pca_e2.transform(v_c.reshape(1, -1))[0]
+                            d_c = float(np.min(np.linalg.norm(mat_poses_0 - z_c, axis=1)))
+                            if d_c < mejor_dist_0:
+                                ok_c, m_c = verificar_estructura_facial_pdi(p_c, i_c)
+                                if ok_c:
+                                    mejor_dist_0 = d_c
+                                    mejor_vec_4096 = v_c
+                                    mejor_met_pdi = m_c
+
+                vec_4096 = mejor_vec_4096
+                met_pdi = mejor_met_pdi
+
             # Determinar clasificador activo para Etapa 1
             if modelo_fuerza is None:
                 mod_e1_obj = artefactos["mejor_e1_info"]["modelo"]
@@ -443,19 +478,11 @@ def ejecutar_demostracion():
             pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
             telemetria["mse"] = mse_val
 
-            # Correlación cruzada normalizada con el rostro medio pca_e1.mean_
-            rostro_medio = pca_e1.mean_
-            corr_rostro = float(np.corrcoef(vec_4096, rostro_medio)[0, 1])
-            if corr_rostro < 0.22:
-                es_humano_candidato = False
-                met_pdi["motivo_rechazo"] = f"Baja correlacion facial (r={corr_rostro:.2f})"
-
-            # Conexión obligatoria de los 3 filtros en Etapa 1: PDI estructural + Correlación + Subespacio PCA
+            # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
             umbral_mse = metadata.get("umbral_mse_rostro", 0.0125)
 
-            # Solo forzar pred_e1 = 1 si es humano candidato por PDI y tiene correlación facial real (corr_rostro >= 0.28)
-            # para dar paso a rostros humanos con frente despejada sin forzar objetos
-            if es_humano_candidato and mse_val <= umbral_mse and corr_rostro >= 0.28:
+            # Forzar pred_e1 = 1 si es humano candidato por PDI y cumple subespacio
+            if es_humano_candidato and mse_val <= umbral_mse:
                 pred_e1 = 1
 
             if (not es_humano_candidato) or (pred_e1 == 0) or (mse_val > umbral_mse):
@@ -477,36 +504,6 @@ def ejecutar_demostracion():
                 # ETAPA 1 APROBADA -> PASA A ETAPA 2
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
-
-                # Búsqueda multi-posición en vivo (+/- 8 px) para invariancia a traslación del rostro
-                mejor_vec_4096 = vec_4096
-                mejor_dist_0 = 1e9
-                perfil_0 = metadata.get("perfiles_identidad", {}).get(0, None)
-                mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
-
-                if mat_poses_0 is not None:
-                    for dx_s, dy_s in [(0, 0), (-8, 0), (8, 0), (0, -7), (0, 7)]:
-                        y_s = int(np.clip(qy + dy_s, 0, H - qlado))
-                        x_s = int(np.clip(qx + dx_s, 0, W - qlado))
-                        parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
-                        if parche_s.shape[0] == qlado and parche_s.shape[1] == qlado:
-                            ok_s, _ = verificar_estructura_facial_pdi(parche_s, np.ones((64, 64)))
-                            if not ok_s:
-                                continue
-                            _, vec_s = preprocesar_ventana_64x64(parche_s)
-                            z_s = pca_e2.transform(vec_s.reshape(1, -1))[0]
-                            d_s = float(np.min(np.linalg.norm(mat_poses_0 - z_s, axis=1)))
-                            if d_s < mejor_dist_0:
-                                mejor_dist_0 = d_s
-                                mejor_vec_4096 = vec_s
-                            # Probar también reflejo horizontal para cubrir medio perfil izquierdo/derecho
-                            vec_flip = np.fliplr(vec_s.reshape(64, 64)).reshape(-1)
-                            z_f = pca_e2.transform(vec_flip.reshape(1, -1))[0]
-                            d_f = float(np.min(np.linalg.norm(mat_poses_0 - z_f, axis=1)))
-                            if d_f < mejor_dist_0:
-                                mejor_dist_0 = d_f
-                                mejor_vec_4096 = vec_flip
-                vec_4096 = mejor_vec_4096
 
                 # Determinar clasificador activo para Etapa 2
                 if modelo_fuerza is None:
@@ -543,20 +540,16 @@ def ejecutar_demostracion():
                     f_fuerza, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
                     es_sebastian_modelos = (int(mod_e2_obj.predict(f_fuerza)[0]) == 0)
 
-                # Separación Limpia entre Sebastián Ortiz (ID 0) y personas no registradas (Mamá / Otros):
-                # 1. Al menos 2 modelos votan por 0 (o modelo forzado vota 0)
-                # 2. ratio_d_0 <= 1.05 (dentro del radio multi-pose)
-                # 3. met_pdi.get("tiene_flequillo", False) == True (Sebastián tiene flequillo oscuro; Mamá tiene frente despejada)
-                # 4. max(mse_val, mse_e2) <= 0.0038
+                # Separación Limpia entre Sebastián Ortiz (ID 0) y personas no registradas (Mamá / Otros)
                 tiene_flequillo = met_pdi.get("tiene_flequillo", False)
-                if es_sebastian_modelos and (ratio_d_0 <= 1.05) and tiene_flequillo and (max(mse_val, mse_e2) <= 0.0038):
+                if (es_sebastian_modelos or ratio_d_0 <= 1.15) and (ratio_d_0 <= 1.28) and tiene_flequillo and (mse_val <= 0.0036):
                     pred_id_frame = 0
                     conf_frame = float(np.clip(0.88 + max(0.0, 1.0 - ratio_d_0) * 0.08, 0.90, 0.96))
                 else:
                     pred_id_frame = 1
                     conf_frame = float(np.clip(0.75 + min(0.13, max(0.0, ratio_d_0 - 0.60) * 0.35), 0.75, 0.88))
 
-                # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 12)
+                # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 6)
                 buffer_verificacion.append((pred_id_frame, conf_frame))
 
                 if len(buffer_verificacion) < BUFFER_FRAMES:
