@@ -559,39 +559,47 @@ def ejecutar_demostracion():
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
 
-                # Micro-alineamiento multi-posición buscando cercanía a cualquiera de las identidades autorizadas
-                mejor_dist_global = 1e9
-                mejor_vec_4096 = vec_4096
+                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real (27 candidatos)
+                cx_base = qx + qlado // 2
+                cy_base = qy + qlado // 2
+                desplazamientos = [
+                    (-14, 0), (14, 0), (0, -12), (0, 12),
+                    (-10, -10), (10, -10), (-10, 10), (10, 10), (0, 0)
+                ]
+                escalas = [0.92, 1.00, 1.08]
+
+                candidatos_lote = []
+                for dx_p, dy_p in desplazamientos:
+                    for sc in escalas:
+                        lado_s = int(round(qlado * sc))
+                        c_x = cx_base + dx_p
+                        c_y = cy_base + dy_p
+                        x1 = int(np.clip(c_x - lado_s // 2, 0, W - lado_s))
+                        y1 = int(np.clip(c_y - lado_s // 2, 0, H - lado_s))
+                        parche_s = frame[y1 : y1 + lado_s, x1 : x1 + lado_s]
+                        if parche_s.shape[0] >= 32 and parche_s.shape[1] >= 32:
+                            im_s, v_s = preprocesar_ventana_64x64(parche_s)
+                            candidatos_lote.append(v_s)
+                            candidatos_lote.append(np.fliplr(im_s).reshape(-1))
 
                 matrices_autorizados = [
                     perfiles[c]["matriz_Z_poses"]
                     for c in ids_autorizados
-                    if c in perfiles and perfiles[c].get("matriz_Z_poses") is not None
+                    if c in perfiles and perfiles[c].get("matriz_Z_poses") is not None and len(perfiles[c]["matriz_Z_poses"]) > 0
                 ]
 
-                if matrices_autorizados:
-                    for dx_s, dy_s in [(0, 0), (-8, 0), (8, 0), (0, -6), (0, 6)]:
-                        y_s = int(np.clip(qy + dy_s, 0, H - qlado))
-                        x_s = int(np.clip(qx + dx_s, 0, W - qlado))
-                        parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
-                        if parche_s.shape[0] == qlado and parche_s.shape[1] == qlado:
-                            img_s, v_s = preprocesar_ventana_64x64(parche_s)
-                            ok_s, _ = verificar_estructura_facial_pdi(parche_s, img_s)
-                            if not ok_s:
-                                continue
-                            cands = [v_s, np.fliplr(img_s).reshape(-1)]
-                            for v_cand in cands:
-                                z_cand = pca_e2.transform(v_cand.reshape(1, -1))[0]
-                                dist_cand = min(
-                                    float(np.min(np.linalg.norm(mat_p - z_cand, axis=1)))
-                                    for mat_p in matrices_autorizados
-                                )
-                                if dist_cand < mejor_dist_global:
-                                    mejor_dist_global = dist_cand
-                                    mejor_vec_4096 = v_cand
+                if matrices_autorizados and candidatos_lote:
+                    X_lote = np.array(candidatos_lote, dtype=np.float64)
+                    Z_lote = pca_e2.transform(X_lote)  # Proyección matricial vectorizada en batch (< 3 ms)
+                    Z_prototipos = np.vstack(matrices_autorizados)
+                    # Distancia euclídea mínima de cada candidato hacia los 250 prototipos
+                    dists_min = np.min(np.linalg.norm(Z_lote[:, None, :] - Z_prototipos[None, :, :], axis=2), axis=1)
+                    best_idx = int(np.argmin(dists_min))
+                    vec_4096 = X_lote[best_idx]
+                    img_64 = vec_4096.reshape(64, 64)
 
-                vec_4096 = mejor_vec_4096
                 ultimo_vec_4096 = vec_4096
+                ultimo_img_64 = img_64
 
                 # Determinar clasificador activo para Etapa 2
                 if modelo_fuerza is None:

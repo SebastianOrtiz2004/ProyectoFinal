@@ -55,7 +55,7 @@ def entrenar_evaluar_cnn():
     print(f"Conjunto de entrenamiento: {X_ent.shape[0]} imágenes de 64x64x1")
     print(f"Conjunto de prueba: {X_pru.shape[0]} imágenes de 64x64x1")
 
-    print("\nAplicando Bloque Convolucional 2D [6 Filtros + ReLU + MaxPool2D 4x4 + AvgPool2D 8x8]...")
+    print("\nAplicando Bloque Convolucional 2D [8 Filtros + ReLU + MaxPool2D 4x4 + AvgPool2D 8x8]...")
     F_conv_ent = extraer_mapas_convolucionales_2d(X_ent)
     F_conv_pru = extraer_mapas_convolucionales_2d(X_pru)
     print(f"Dimensión del mapa de características convolucional: {F_conv_ent.shape[1]}")
@@ -65,13 +65,13 @@ def entrenar_evaluar_cnn():
     F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent)
     F_conv_pru_s = scaler_cnn.transform(F_conv_pru)
 
-    print("Entrenando clasificador denso completamente conectado con regularización L2 y Early Stopping...")
+    print("Entrenando clasificador denso profundo (256, 128) con regularización L2 y Early Stopping...")
     # Capa Densa Final (Softmax / Cross-Entropy)
     clf_cnn = MLPClassifier(
-        hidden_layer_sizes=(128, 64),
+        hidden_layer_sizes=(256, 128),
         activation="relu",
-        alpha=0.15,  # Regularización anti-overfitting
-        max_iter=400,
+        alpha=0.1,  # Regularización anti-overfitting
+        max_iter=500,
         early_stopping=True,
         random_state=42,
     )

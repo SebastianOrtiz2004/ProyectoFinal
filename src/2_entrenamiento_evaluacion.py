@@ -104,13 +104,10 @@ def cargar_dataset_completo():
             im_mask = aplicar_mascara_eliptica_a_img64(im_double)
             X_obj_local.append(im_mask.reshape(-1))
 
-    # Cargar hasta 250 fondos/paredes reales
-    np.random.seed(42)
-    n_wall = min(len(archivos_wall), 250)
-    idx_w = np.random.choice(len(archivos_wall), size=n_wall, replace=False) if len(archivos_wall) > 0 else []
+    # Cargar TODOS los fondos/paredes reales disponibles (sin recortar a 250)
     X_wall_local = []
-    for i in idx_w:
-        im = cv2_imread_unicode(archivos_wall[i], cv2.IMREAD_GRAYSCALE)
+    for f in archivos_wall:
+        im = cv2_imread_unicode(f, cv2.IMREAD_GRAYSCALE)
         if im is not None:
             if im.shape != (64, 64):
                 im = cv2.resize(im, (64, 64))
@@ -118,7 +115,7 @@ def cargar_dataset_completo():
             im_mask = aplicar_mascara_eliptica_a_img64(im_double)
             X_wall_local.append(im_mask.reshape(-1))
 
-    print(f"  [DATOS REALES] Clase 0 cargada: {len(X_obj_local)} objetos reales (todos) + {len(X_wall_local)} fondos/paredes (hasta 250).")
+    print(f"  [DATOS REALES] Clase 0 cargada: {len(X_obj_local)} objetos reales + {len(X_wall_local)} fondos/paredes (100% muestras reales sin descarte).")
 
     # 4. Descubrimiento dinámico de identidades reales en data/dataset_procesado_64x64/ (mínimo 15 fotos)
     dict_identidades = {}
@@ -175,59 +172,58 @@ def cargar_dataset_completo():
 def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None):
     """
     Etapa 1 (Binaria):
-        Clase 0: No Persona (450 muestras: objetos reales + fliplr + completado con fondos)
-        Clase 1: Es Persona (450 muestras: Sebastián uniforme multi-pose con aumentación geométrica + Olivetti)
-    Balanceo estricto 50% / 50% (450 vs 450).
+        Clase 0: No Persona (1,280 muestras: todos los objetos reales + fliplr + completado con fondos)
+        Clase 1: Es Persona (1,280 muestras: 100% fotos reales de Sebastián + 350 aumentación + Olivetti)
+    Balanceo estricto 50% / 50% (1,280 vs 1,280).
     """
     rostros_list = []
     variaciones = [
-        (-5, 0, 1.0, False), (5, 0, 1.0, False),
-        (0, -4, 1.0, False), (0, 4, 1.0, False),
-        (-4, -4, 1.0, False), (4, 4, 1.0, False),
-        (0, 0, 0.92, False), (0, 0, 1.08, False),
-        (0, 0, 1.0, True), (3, 0, 1.0, True), (-3, 0, 1.0, True)
+        (-8, 0, 1.0, False), (8, 0, 1.0, False),
+        (0, -8, 1.0, False), (0, 8, 1.0, False),
+        (-6, -6, 1.0, False), (6, 6, 1.0, False),
+        (-5, 0, 0.95, False), (5, 0, 1.05, False),
+        (0, -5, 0.95, False), (0, 5, 1.05, False),
+        (0, 0, 0.90, False), (0, 0, 0.95, False),
+        (0, 0, 1.05, False), (0, 0, 1.10, False),
+        (0, 0, 1.0, True), (5, 0, 1.0, True), (-5, 0, 1.0, True),
+        (0, -5, 1.0, True), (0, 5, 1.0, True),
+        (-6, -6, 1.05, True), (6, 6, 0.95, True),
+        (-4, 0, 0.90, True), (4, 0, 1.10, True),
     ]
 
     for k in dict_identidades:
-        data_k = dict_identidades[k]["data"]
-        N_k = len(data_k)
-        if N_k > 250:
-            idx_unif = np.linspace(0, N_k - 1, 250, dtype=int)
-            sel_k = data_k[idx_unif]
-        else:
-            sel_k = data_k
-        rostros_list.append(sel_k)
+        data_k = dict_identidades[k]["data"]  # 100% de fotos reales de cada identidad
+        rostros_list.append(data_k)
 
-        # Aumentación geométrica multi-posición y escala (120 muestras)
-        np.random.seed(42)
-        idx_aug = np.random.choice(len(sel_k), size=min(120, len(sel_k)), replace=False)
+        # 350 muestras con aumentación geométrica multi-escala y traslación
+        np.random.seed(42 + k)
+        idx_aug = np.random.choice(len(data_k), size=350, replace=(len(data_k) < 350))
         muestras_aug = []
         for i, idx_a in enumerate(idx_aug):
-            img_m = sel_k[idx_a].reshape(64, 64)
+            img_m = data_k[idx_a].reshape(64, 64)
             dx, dy, sc, fl = variaciones[i % len(variaciones)]
             im_warp = aumentar_geometria_rostro(img_m, dx=dx, dy=dy, scale=sc, flip=fl)
             muestras_aug.append(im_warp.reshape(-1))
         rostros_list.append(np.array(muestras_aug))
 
-    # Olivetti: 100 muestras
-    np.random.seed(42)
-    idx_oli = np.random.choice(len(X_olivetti), size=min(100, len(X_olivetti)), replace=False)
-    rostros_list.append(X_olivetti[idx_oli])
-
-    X_humanos = np.vstack(rostros_list)
-    if len(X_humanos) > 450:
+    rostros_humanos_totales = np.vstack(rostros_list)
+    if len(rostros_humanos_totales) < 1280:
+        faltan_h = 1280 - len(rostros_humanos_totales)
         np.random.seed(42)
-        idx_h = np.random.choice(len(X_humanos), size=450, replace=False)
-        X_humanos = X_humanos[idx_h]
-    elif len(X_humanos) < 450:
-        faltan = 450 - len(X_humanos)
-        idx_extra = np.random.choice(len(X_olivetti), size=faltan, replace=True)
-        X_humanos = np.vstack([X_humanos, X_olivetti[idx_extra]])
+        idx_oli = np.random.choice(len(X_olivetti), size=min(faltan_h, len(X_olivetti)), replace=False)
+        rostros_humanos_totales = np.vstack([rostros_humanos_totales, X_olivetti[idx_oli]])
+
+    if len(rostros_humanos_totales) > 1280:
+        np.random.seed(42)
+        idx_h_sel = np.random.choice(len(rostros_humanos_totales), size=1280, replace=False)
+        X_humanos = rostros_humanos_totales[idx_h_sel]
+    else:
+        X_humanos = rostros_humanos_totales
 
     y_humanos = np.ones(len(X_humanos), dtype=int)
-    num_humanos = len(X_humanos)
+    num_humanos = 1280
 
-    # Muestras no humanas (Clase 0): objetos reales + fliplr + fondos
+    # Clase 0: No Persona (1,280 muestras con todos los objetos + fondos)
     no_humano_list = []
     if X_obj is not None and len(X_obj) > 0:
         no_humano_list.append(X_obj)
@@ -235,7 +231,6 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
         no_humano_list.append(obj_flip)
 
     X_objs_aug = np.vstack(no_humano_list) if no_humano_list else np.empty((0, 4096))
-
     if len(X_objs_aug) >= num_humanos:
         np.random.seed(42)
         idx_sel = np.random.choice(len(X_objs_aug), size=num_humanos, replace=False)
@@ -253,7 +248,7 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 
     X_etapa1 = np.vstack([X_no_humano, X_humanos])
     y_etapa1 = np.concatenate([y_no_humano, y_humanos])
-    print(f"  [BALANCE ETAPA 1] Clase 0 (No Persona): {len(y_no_humano)} | Clase 1 (Persona): {len(y_humanos)} (Balance 50/50 estricto: 450 vs 450).")
+    print(f"  [BALANCE ETAPA 1] Clase 0 (No Persona): {len(y_no_humano)} | Clase 1 (Persona): {len(y_humanos)} (Balance 50/50 estricto: 1280 vs 1280).")
 
     return X_etapa1, y_etapa1
 
@@ -261,46 +256,46 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=None):
     """
     Etapa 2 (Multiclase de Identidad):
-        Para cada ID registrado: hasta 250 uniformes + 150 aumentación multi-posición/escala = 400 muestras.
-        Clase Desconocido / Otros: Olivetti + objetos reales + fondos de la habitación = 400 muestras.
+        Para cada ID registrado: 100% fotos reales (~933) + 350 aumentación geométrica = 1,280 muestras.
+        Clase Desconocido / Otros: Olivetti + Objetos reales + fliplr + Fondos = 1,280 muestras.
     """
     X_list = []
     y_list = []
     nombres_clases = {}
 
     variaciones = [
-        (-5, 0, 1.0, False), (5, 0, 1.0, False),
-        (0, -4, 1.0, False), (0, 4, 1.0, False),
-        (-4, -4, 1.0, False), (4, 4, 1.0, False),
-        (0, 0, 0.92, False), (0, 0, 1.08, False),
-        (0, 0, 1.0, True), (3, 0, 1.0, True), (-3, 0, 1.0, True),
-        (-3, -3, 1.04, True), (3, 3, 0.96, True)
+        (-8, 0, 1.0, False), (8, 0, 1.0, False),
+        (0, -8, 1.0, False), (0, 8, 1.0, False),
+        (-6, -6, 1.0, False), (6, 6, 1.0, False),
+        (-5, 0, 0.95, False), (5, 0, 1.05, False),
+        (0, -5, 0.95, False), (0, 5, 1.05, False),
+        (0, 0, 0.90, False), (0, 0, 0.95, False),
+        (0, 0, 1.05, False), (0, 0, 1.10, False),
+        (0, 0, 1.0, True), (5, 0, 1.0, True), (-5, 0, 1.0, True),
+        (0, -5, 1.0, True), (0, 5, 1.0, True),
+        (-6, -6, 1.05, True), (6, 6, 0.95, True),
+        (-4, 0, 0.90, True), (4, 0, 1.10, True),
     ]
 
     for id_num in sorted(dict_identidades.keys()):
         info = dict_identidades[id_num]
-        data = info["data"]
-        N_data = len(data)
-        if N_data > 250:
-            idx_unif = np.linspace(0, N_data - 1, 250, dtype=int)
-            data_sel = data[idx_unif]
-        else:
-            data_sel = data
+        data = info["data"]  # 100% de fotos reales (sin descarte a 250!)
 
+        # 350 muestras con aumentación geométrica
         np.random.seed(42 + id_num)
-        idx_aug = np.random.choice(len(data_sel), size=150, replace=(len(data_sel) < 150))
+        idx_aug = np.random.choice(len(data), size=350, replace=(len(data) < 350))
         muestras_aug = []
         for i, idx_a in enumerate(idx_aug):
-            img_m = data_sel[idx_a].reshape(64, 64)
+            img_m = data[idx_a].reshape(64, 64)
             dx, dy, sc, fl = variaciones[i % len(variaciones)]
             im_warp = aumentar_geometria_rostro(img_m, dx=dx, dy=dy, scale=sc, flip=fl)
             muestras_aug.append(im_warp.reshape(-1))
 
-        data_clase = np.vstack([data_sel, np.array(muestras_aug)])
-        if len(data_clase) > 400:
-            data_clase = data_clase[:400]
-        elif len(data_clase) < 400:
-            faltan = 400 - len(data_clase)
+        data_clase = np.vstack([data, np.array(muestras_aug)])
+        if len(data_clase) > 1280:
+            data_clase = data_clase[:1280]
+        elif len(data_clase) < 1280:
+            faltan = 1280 - len(data_clase)
             idx_rep = np.random.choice(len(data_clase), size=faltan, replace=True)
             data_clase = np.vstack([data_clase, data_clase[idx_rep]])
 
@@ -308,33 +303,30 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
         y_list.append(np.full(len(data_clase), id_num, dtype=int))
         nombres_clases[id_num] = info["nombre"]
 
-    # Clase 'Desconocido / Otros': 180 Olivetti + 120 Objetos + 100 Fondos/Paredes (400 muestras)
+    # Clase 'Desconocido / Otros': 1,280 muestras (Olivetti + Objetos + Fondos)
     id_desconocido = max(dict_identidades.keys()) + 1 if dict_identidades else 1
-    np.random.seed(42)
-    idx_oli_e2 = np.random.choice(len(X_olivetti), size=min(180, len(X_olivetti)), replace=False)
-    rostros_desconocidos = X_olivetti[idx_oli_e2]
+    desc_componentes = []
 
-    desc_componentes = [rostros_desconocidos]
+    # 1. Olivetti Faces completos
+    desc_componentes.append(X_olivetti)
 
-    # 120 objetos/manos
+    # 2. Objetos reales + fliplr
     if X_obj is not None and len(X_obj) > 0:
-        np.random.seed(42)
-        n_obj_sel = min(120, len(X_obj))
-        idx_obj_desc = np.random.choice(len(X_obj), size=n_obj_sel, replace=False)
-        desc_componentes.append(X_obj[idx_obj_desc])
+        desc_componentes.append(X_obj)
+        obj_fl = np.array([np.fliplr(im.reshape(64, 64)).reshape(-1) for im in X_obj])
+        desc_componentes.append(obj_fl)
 
-    # 100 fondos/paredes/puertas de la misma habitación
+    # 3. Fondos de la habitación
     if X_fondo is not None and len(X_fondo) > 0:
-        np.random.seed(42)
-        n_fnd_sel = min(100, len(X_fondo))
-        idx_fnd_desc = np.random.choice(len(X_fondo), size=n_fnd_sel, replace=False)
-        desc_componentes.append(X_fondo[idx_fnd_desc])
+        desc_componentes.append(X_fondo)
 
     desconocidos_total = np.vstack(desc_componentes)
-    if len(desconocidos_total) > 400:
-        desconocidos_total = desconocidos_total[:400]
-    elif len(desconocidos_total) < 400:
-        faltan_desc = 400 - len(desconocidos_total)
+    if len(desconocidos_total) > 1280:
+        np.random.seed(42)
+        idx_desc_sel = np.random.choice(len(desconocidos_total), size=1280, replace=False)
+        desconocidos_total = desconocidos_total[idx_desc_sel]
+    elif len(desconocidos_total) < 1280:
+        faltan_desc = 1280 - len(desconocidos_total)
         idx_extra_oli = np.random.choice(len(X_olivetti), size=faltan_desc, replace=True)
         desconocidos_total = np.vstack([desconocidos_total, X_olivetti[idx_extra_oli]])
 
@@ -345,7 +337,7 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
     X_etapa2 = np.vstack(X_list)
     y_etapa2 = np.concatenate(y_list)
     resumen_clases = " | ".join(f"{nombres_clases[c]}: {np.sum(y_etapa2 == c)}" for c in sorted(nombres_clases.keys()))
-    print(f"  [BALANCE ETAPA 2 MULTICLASE] {resumen_clases}")
+    print(f"  [BALANCE ETAPA 2 MULTICLASE] {resumen_clases} (1,280 muestras por clase).")
 
     return X_etapa2, y_etapa2, nombres_clases
 
@@ -417,7 +409,7 @@ def agregar_ruido_suave_sensor(X_mat, sigma=0.012, seed=42):
 def definir_modelos_y_grillas():
     """
     Define los 5 clasificadores supervisados obligatorios del sílabo
-    con hiperparámetros de regularización anti-overfitting para GridSearchCV.
+    con hiperparámetros ampliados para aprovechar la máxima capacidad computacional.
     """
     clasificadores = {
         "k-NN": (
@@ -430,33 +422,33 @@ def definir_modelos_y_grillas():
         "Árbol de decisión": (
             DecisionTreeClassifier(class_weight="balanced", random_state=42),
             {
-                "max_depth": [4, 5],
-                "min_samples_leaf": [6, 8, 10],
+                "max_depth": [4, 6],
+                "min_samples_leaf": [4, 8],
                 "criterion": ["gini", "entropy"],
             },
         ),
         "Random Forest": (
             RandomForestClassifier(class_weight="balanced", random_state=42),
             {
-                "n_estimators": [100, 150],
-                "max_depth": [6, 8],
-                "min_samples_leaf": [3, 5],
+                "n_estimators": [150, 250],
+                "max_depth": [8, 12],
+                "min_samples_leaf": [2, 4],
             },
         ),
         "SVM": (
             SVC(probability=True, class_weight="balanced", random_state=42),
             {
-                "C": [0.5, 1.0, 2.0],
+                "C": [1.0, 3.0, 5.0],
                 "kernel": ["rbf"],
-                "gamma": ["scale", "auto"],
+                "gamma": ["scale"],
             },
         ),
         "ANN (MLP)": (
             MLPClassifier(max_iter=500, early_stopping=True, random_state=42),
             {
-                "hidden_layer_sizes": [(64,), (64, 32)],
-                "alpha": [0.2, 0.5, 1.0],
-                "learning_rate_init": [0.001, 0.005],
+                "hidden_layer_sizes": [(128, 64), (128,)],
+                "alpha": [0.1, 0.2],
+                "learning_rate_init": [0.001],
             },
         ),
     }
@@ -468,13 +460,13 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     Ejecuta el ciclo experimental completo para una etapa:
     1. Partición 80/20 en bloques de 10 imágenes consecutivas (8 a entrenamiento y 2 a prueba).
     2. Perturbación suave y simétrica de sensor (sigma = 0.012 con filtro gaussiano 3x3).
-    3. PCA 95% varianza calibrado:
+    3. PCA 97% varianza calibrado:
        - En Etapa 1: calibrado EXCLUSIVAMENTE sobre rostros humanos (y_ent == 1).
        - En Etapa 2: calibrado sobre identidades de entrenamiento.
     4. Extracción de f = [z_PCA, MSE, Sim_Adapt, Ratio_HV] en R^(K+3).
     5. Escalado que preserva la varianza relativa de las Eigenfaces para todos los modelos.
     6. GridSearchCV con StratifiedKFold(n_splits=5).
-    7. Cálculo de umbral_mse_rostro y perfiles multi-pose de identidad (matriz_Z_poses y radio_pose).
+    7. Cálculo de umbral_mse_rostro y perfiles multi-pose de identidad (250 prototipos en matriz_Z_poses).
     """
     print(f"\n{'=' * 75}\nEJECUTANDO: {nombre_etapa.upper()}\n{'=' * 75}")
 
@@ -501,8 +493,8 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
 
     print(f"Dimensiones de matrices: X_ent={X_ent.shape}, X_pru={X_pru.shape}")
 
-    # PCA con retención del 95% de la varianza explicada acumulada (sin blanqueo para estabilidad de distancias)
-    pca = PCA(n_components=0.95, whiten=False, random_state=42)
+    # PCA con retención del 97% de la varianza explicada acumulada
+    pca = PCA(n_components=0.97, whiten=False, random_state=42)
     if "Etapa 1" in nombre_etapa:
         # Subespacio Facial Exclusivo de Rostros Humanos
         pca.fit(X_ent[y_ent == 1])
@@ -512,7 +504,7 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     F_ent, mse_ent = extraer_caracteristicas_pca_mse(pca, X_ent)
     F_pru, mse_pru = extraer_caracteristicas_pca_mse(pca, X_pru)
     K = pca.n_components_
-    print(f"Componentes PCA retenidas (varianza >= 95%): K = {K}")
+    print(f"Componentes PCA retenidas (varianza >= 97%): K = {K}")
     print(f"Dimensión del vector final f ∈ R^(K+3): {F_ent.shape[1]}")
 
     # Escalador que preserva la relación de autovalores de Eigenfaces
@@ -537,12 +529,12 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
             radio_c = float(np.percentile(dists_c, 98) * 1.40)
             dist_media = float(np.mean(dists_c))
 
-            # Matriz de referencia matriz_Z_poses con 80 prototipos representativos multi-pose
-            idx_p = np.linspace(0, len(Z_c) - 1, min(80, len(Z_c)), dtype=int)
+            # Matriz de referencia matriz_Z_poses con 250 prototipos representativos multi-pose
+            idx_p = np.linspace(0, len(Z_c) - 1, min(250, len(Z_c)), dtype=int)
             matriz_Z_poses = Z_c[idx_p]
 
             from sklearn.neighbors import NearestNeighbors
-            nn_poses = NearestNeighbors(n_neighbors=min(8, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
+            nn_poses = NearestNeighbors(n_neighbors=min(12, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
             dists_min_pose, _ = nn_poses.kneighbors(Z_c)
             radio_pose = float(np.percentile(dists_min_pose[:, -1], 95) * 1.25)
 
@@ -554,7 +546,7 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
                 "dist_media": dist_media,
             }
             nom_c = nombres_clases.get(int(c), f"ID {c}") if nombres_clases else f"ID {c}"
-            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f}, Dist media={dist_media:.3f}")
+            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} (250 prototipos), Dist media={dist_media:.3f}")
         datos_adicionales["perfiles_identidad"] = perfiles_identidad
 
         # Umbral de reconstrucción MSE para identidades autorizadas (excluyendo id_desconocido)

@@ -634,15 +634,15 @@ def extraer_descriptor_espacial_bloques(im_64: np.ndarray) -> np.ndarray:
 def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
     """
     Bloque Convolucional 2D Auténtico de Cátedra (Para Fase Posterior CNN e Inferencia en Vivo):
-    Aplica 6 kernels 2D (3x3): Sobel H, Sobel V, Pasa-Altos de Cátedra, High-Boost Centro 9,
-    Diagonal Principal y Diagonal Secundaria.
+    Aplica 8 kernels 2D: Sobel H, Sobel V, Pasa-Altos de Cátedra, High-Boost Centro 9,
+    Diagonal 45°, Diagonal 135°, y 2 Filtros de Gabor/Banda 5x5 (Horizontal y Vertical).
     Para cada kernel:
-      1. Convolución 2D con cv2.filter2D(img, cv2.CV_64F, k)
+      1. Convolución 2D rápida con cv2.filter2D(img, cv2.CV_64F, k)
       2. Activación no lineal ReLU: relu = np.maximum(0.0, conv)
-      3. Max-Pooling 2D auténtico de 4x4 (reduce 64x64 a 16x16 tomando el máximo real del bloque,
-         lo que otorga invariancia a traslación espacial).
+      3. Max-Pooling 2D auténtico por bloques de 4x4 (reduce 64x64 a 16x16 tomando el máximo real del bloque,
+         lo que otorga invariancia a traslación espacial sin pérdida ciega de píxeles).
     Además, extrae Average-Pooling 2D de 8x8 de la imagen directa (reduce 64x64 a 8x8 capturando la estructura global).
-    Concatena los 6 mapas Max-Pool (6 * 256 = 1536) + Average-Pool (64) = 1600 características convolucionales 2D.
+    Concatena los 8 mapas Max-Pool (8 * 256 = 2048) + Average-Pool (64) = 2112 características convolucionales 2D.
     """
     if imagenes_64x64.ndim == 2:
         imgs = imagenes_64x64.reshape(1, 64, 64)
@@ -658,9 +658,15 @@ def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
     k_dp = np.array([[2.0, -1.0, -1.0], [-1.0, 2.0, -1.0], [-1.0, -1.0, 2.0]], dtype=np.float64) / 4.0
     k_ds = np.array([[-1.0, -1.0, 2.0], [-1.0, 2.0, -1.0], [2.0, -1.0, -1.0]], dtype=np.float64) / 4.0
 
-    kernels = [k_sh, k_sv, k_pa, k_hb, k_dp, k_ds]
+    # 2 Filtros de Gabor / Banda 5x5 (Horizontal y Vertical)
+    k_gh = cv2.getGaborKernel((5, 5), sigma=1.2, theta=0.0, lambd=3.0, gamma=0.5, psi=0, ktype=cv2.CV_64F)
+    k_gh = k_gh / (np.sum(np.abs(k_gh)) + 1e-6)
+    k_gv = cv2.getGaborKernel((5, 5), sigma=1.2, theta=np.pi / 2.0, lambd=3.0, gamma=0.5, psi=0, ktype=cv2.CV_64F)
+    k_gv = k_gv / (np.sum(np.abs(k_gv)) + 1e-6)
+
+    kernels = [k_sh, k_sv, k_pa, k_hb, k_dp, k_ds, k_gh, k_gv]
     N = len(imgs)
-    F_conv = np.empty((N, 1600), dtype=np.float64)
+    F_conv = np.empty((N, 2112), dtype=np.float64)
 
     for i in range(N):
         im = imgs[i].astype(np.float64)
