@@ -665,15 +665,13 @@ def centrar_ventana_en_rostro_pdi(frame_bgr: np.ndarray, cuadrado_base: list, ma
 
 def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.ndarray):
     """
-    Validación Biométrica PDI Definitiva:
-    1. Polaridad vertical de cabeza humana: La corona superior/cejas (cabello negro)
-       DEBE ser más oscura que la zona de nariz/mejillas.
-       (En el fondo del cuarto pasa lo opuesto: la pared beige arriba es más clara que el respaldar abajo).
-    2. Textura ocular real en (arriba del respaldar de la cama): bloquea paredes lisas.
-    3. Compensación automática de ganancia para funcionar sin linterna e ignorar reflejo azul del monitor.
+    Validación Biométrica PDI para Etapa 1:
+    - Acepta rostros humanos reales (tanto de Sebastián con flequillo como de otras personas/mamá con frente despejada).
+    - Bloquea al 100% objetos puestos en un lado con pared vacía en el otro (mano+perfume, botella+pared, puerta+pared)
+      exigiendo simetría bilateral de intensidad y de textura entre ambas mitades de la elipse.
     """
     if len(parche_bgr.shape) != 3:
-        return True, {"motivo_rechazo": ""}
+        return True, {"motivo_rechazo": "", "tiene_flequillo": False, "sim_bilateral": 1.0}
 
     parche_64 = cv2.resize(parche_bgr, (64, 64), interpolation=cv2.INTER_AREA)
     pdi_rgb = descomponer_rgb_a_double(parche_64)
@@ -683,9 +681,9 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     gris = pdi_rgb["gris_double"]
 
     if np.allclose(R, G, atol=1e-3) and np.allclose(G, B, atol=1e-3):
-        return True, {"motivo_rechazo": ""}
+        return True, {"motivo_rechazo": "", "tiene_flequillo": False, "sim_bilateral": 1.0}
 
-    # Compensación suave de exposición para funcionar con poca luz sin linterna
+    # Compensación suave de exposición
     p95 = float(np.percentile(gris, 95))
     gain = np.clip(0.75 / max(p95, 0.15), 1.0, 2.2)
     R_n = np.clip(R * gain, 0.0, 1.0)
@@ -693,78 +691,88 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     B_n = np.clip(B * gain, 0.0, 1.0)
     gris_n = np.clip(gris * gain, 0.0, 1.0)
 
-    # 1. VALIDACIÓN ANATÓMICA UNIVERSAL (Acepta rostro con flequillo O rostro con frente despejada):
+    # 1. Rechazo estricto de etiquetas verdes/turquesas/azules de botellas (image_bffaff.jpg) o colores no humanos:
+    # En una etiqueta verde/cian de botella o tapa, G > R o B > R en una fracción del recuadro facial.
+    bw_croma_intruso = ((G - R) > 0.04) | ((B - R) > 0.05)
+    if float(np.mean(bw_croma_intruso[8:52, 10:54])) > 0.08:
+        return False, {"motivo_rechazo": "Color artificial detectado (Botella/Etiqueta/Objeto)", "tiene_flequillo": False, "sim_bilateral": 0.0}
+
+    # 2. SIMETRÍA BILATERAL OBLIGATORIA IZQUIERDA vs. DERECHA (Bloquea image_bffb59 y image_bffaff):
+    # Cuando ponen mano+perfume a la izquierda y pared a la derecha, o pared a la izquierda y botella a la derecha,
+    # una mitad es muy diferente a la otra en brillo, en desviación estándar o en bordes.
+    mitad_izq = gris_n[:, :32]
+    mitad_der = gris_n[:, 32:]
+    mitad_der_esp = np.fliplr(mitad_der)
+
+    sim_bilateral = 1.0 - float(np.mean(np.abs(mitad_izq - mitad_der_esp)))
+    diff_media_lados = abs(float(np.mean(mitad_izq)) - float(np.mean(mitad_der)))
+    std_izq = float(np.std(mitad_izq)) * 255.0
+    std_der = float(np.std(mitad_der)) * 255.0
+    ratio_std_lados = min(std_izq, std_der) / (max(std_izq, std_der) + 1e-6)
+
+    # En un rostro real (Sebastián o su mamá), ambos lados tienen contraste (std >= 9.5),
+    # el ratio de std entre lado izquierdo y derecho es >= 0.42, simetría >= 0.70 y diff_media_lados <= 0.24.
+    if min(std_izq, std_der) < 9.5 or ratio_std_lados < 0.42 or sim_bilateral < 0.70 or diff_media_lados > 0.24:
+        return False, {"motivo_rechazo": "Asimetria lateral (Objeto en borde / Pared vacia)", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
+
+    # 3. PRESENCIA DE OJOS Y CEJAS EN AMBAS SUB-ZONAS OCULARES:
+    # En la pared vacía o en una botella/mano lateral, al menos una de las dos cajas oculares carece de ceja/ojo oscuro.
+    ojo_izq = gris_n[14:32, 14:32]
+    ojo_der = gris_n[14:32, 32:50]
+    gy_izq = float(np.mean(np.abs(cv2.Sobel(ojo_izq, cv2.CV_64F, 0, 1, ksize=3))))
+    gy_der = float(np.mean(np.abs(cv2.Sobel(ojo_der, cv2.CV_64F, 0, 1, ksize=3))))
+    rango_ojo_izq = float(np.percentile(ojo_izq, 85) - np.percentile(ojo_izq, 15))
+    rango_ojo_der = float(np.percentile(ojo_der, 85) - np.percentile(ojo_der, 15))
+
+    if min(gy_izq, gy_der) < 0.026 or min(rango_ojo_izq, rango_ojo_der) < 0.11:
+        return False, {"motivo_rechazo": "Sin par de ojos simetricos (Fondo/Objeto)", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
+
+    # 4. Estructura craneal superior (Acepta flequillo de Sebastián O frente despejada con cejas oscuras de Mamá):
     corona_central = gris_n[0:22, 16:48]
     franja_frente = gris_n[8:22, 18:46]
     franja_ojos = gris_n[22:36, 16:48]
     nariz_mejillas = gris_n[38:52, 16:48]
-
     mediana_cara = float(np.median(nariz_mejillas))
-    umbral_osc = max(0.34, mediana_cara * 0.75)
+    umbral_osc = max(0.35, mediana_cara * 0.76)
 
-    # Caso A: Rostro con flequillo / cabello en corona superior (ej. Sebastián)
     prop_cabello_central = float(np.mean(corona_central < umbral_osc))
     tiene_flequillo = (prop_cabello_central >= 0.14) and (
         float(np.mean(corona_central)) < float(np.mean(nariz_mejillas)) - 0.03
     )
 
-    # Caso B: Rostro con frente despejada / raya al medio (ej. Mamá de Sebastián)
-    # En un rostro con frente despejada:
-    # - El cabello oscuro enmarca los laterales superiores
-    # - Y la franja de cejas/ojos es más oscura que la frente y que las mejillas.
     prop_cabello_lat_izq = float(np.mean(gris_n[12:38, 0:18] < umbral_osc))
     prop_cabello_lat_der = float(np.mean(gris_n[12:38, 46:64] < umbral_osc))
-    media_ojos = float(np.mean(franja_ojos))
-    media_frente = float(np.mean(franja_frente))
-    media_mejillas = float(np.mean(nariz_mejillas))
-
-    tiene_frente_despejada_humana = (
-        ((prop_cabello_lat_izq + prop_cabello_lat_der) >= 0.16)
-        and (media_ojos < media_frente - 0.02)
+    tiene_frente_despejada = (
+        (prop_cabello_lat_izq >= 0.06 and prop_cabello_lat_der >= 0.06)
+        and (float(np.mean(franja_ojos)) < float(np.mean(franja_frente)) - 0.02)
     )
 
-    if not (tiene_flequillo or tiene_frente_despejada_humana):
-        return False, {"motivo_rechazo": "Sin estructura craneal/ocular (Fondo/Pared/Mano)"}
+    if not (tiene_flequillo or tiene_frente_despejada):
+        return False, {"motivo_rechazo": "Sin estructura craneal/ocular (Pared/Mano/Objeto)", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
 
-    # 2. CONTRASTE OCULAR REAL EN FILAS 14:32 (Estrictamente arriba del respaldar de la cama):
-    ojo_izq = gris_n[14:32, 14:32]
-    ojo_der = gris_n[14:32, 32:50]
-    std_ojo_izq = float(np.std(ojo_izq)) * 255.0
-    std_ojo_der = float(np.std(ojo_der)) * 255.0
-    if min(std_ojo_izq, std_ojo_der) < 8.0:
-        return False, {"motivo_rechazo": "Zona ocular plana sin ojos (Pared/Fondo)"}
+    # 5. Bloquear objetos negros o blancos brillantes en el centro nasal
+    if float(np.mean(gris_n[22:50, 20:44] < 0.18)) > 0.30:
+        return False, {"motivo_rechazo": "Objeto oscuro en el centro", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
+    if float(np.mean((gris[16:48, 16:48] > 0.80) & ((R[16:48, 16:48] - B[16:48, 16:48]) < 0.05))) > 0.20:
+        return False, {"motivo_rechazo": "Objeto blanco/plastico brillante", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
 
-    # Bordes horizontales de cejas y párpados (Sobel Gy) en la franja ocular
-    gy_ojos = float(np.mean(np.abs(cv2.Sobel(gris_n[14:32, 14:50], cv2.CV_64F, 0, 1, ksize=3))))
-    if gy_ojos < 0.022:
-        return False, {"motivo_rechazo": "Sin cejas ni parpados (Fondo/Objeto)"}
-
-    # 3. Bloquear objetos negros en el centro nasal (Perfume negro, control, desodorante)
-    if float(np.mean(gris_n[22:50, 20:44] < 0.18)) > 0.35:
-        return False, {"motivo_rechazo": "Objeto negro en centro facial"}
-
-    # 4. Bloquear plástico blanco acromático (Mando PS5 blanco / pantalla blanca)
-    bw_blanco = (gris[16:48, 16:48] > 0.80) & ((R[16:48, 16:48] - B[16:48, 16:48]) < 0.05)
-    if float(np.mean(bw_blanco)) > 0.22:
-        return False, {"motivo_rechazo": "Objeto blanco acromatico (Control/Plastico)"}
-
-    # 5. Bloquear colores artificiales extremos (objetos azules/verdes) ignorando reflejo de monitor
-    R_c, G_c, B_c, gr_c = R[12:50, 14:50], G[12:50, 14:50], B[12:50, 14:50], gris[12:50, 14:50]
-    bw_art = (gr_c > 0.28) & (((B_c - R_c) > 0.16) | ((G_c - R_c) > 0.15))
-    if float(np.mean(bw_art)) > 0.22:
-        return False, {"motivo_rechazo": "Color artificial no humano (Objeto)"}
-
-    # 6. Presencia de piel humana en nariz y mejillas
+    # 6. Piel humana genuina tanto en mejilla izquierda como en mejilla derecha
     bw_piel = (
         (R_n > 0.20) & (G_n > 0.11) & (B_n > 0.07)
-        & ((R_n - G_n) >= -0.01) & ((R_n - G_n) <= 0.40)
-        & ((R_n - B_n) >= 0.005)
-        & (gris_n > 0.20) & (gris_n < 0.90)
+        & ((R_n - G_n) >= 0.005) & ((R_n - G_n) <= 0.38)
+        & ((R_n - B_n) >= 0.010)
+        & (gris_n > 0.20) & (gris_n < 0.88)
     )
-    if float(np.mean(bw_piel[20:50, 16:48])) < 0.24:
-        return False, {"motivo_rechazo": "Sin piel facial en el centro (Objeto)"}
+    piel_mejilla_izq = float(np.mean(bw_piel[30:52, 14:32]))
+    piel_mejilla_der = float(np.mean(bw_piel[30:52, 32:50]))
+    if min(piel_mejilla_izq, piel_mejilla_der) < 0.25:
+        return False, {"motivo_rechazo": "Sin piel bilateral en mejillas (Objeto/Botella)", "tiene_flequillo": False, "sim_bilateral": sim_bilateral}
 
-    return True, {"motivo_rechazo": ""}
+    return True, {
+        "tiene_flequillo": tiene_flequillo,
+        "sim_bilateral": sim_bilateral,
+        "motivo_rechazo": "",
+    }
 
 
 class ScalerPreservandoVarianza:

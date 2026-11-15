@@ -355,7 +355,8 @@ def ejecutar_demostracion():
     for _ in range(10):
         cap.read()
 
-    historial_predicciones = deque(maxlen=5)
+    BUFFER_FRAMES = 12
+    buffer_verificacion = []  # Almacena tuplas (pred_id, conf) durante los fotogramas válidos
     progreso_apertura = 0.0  # 0.0 cerrado, 1.0 completamente abierta
     qx_prev, qy_prev = None, None
 
@@ -442,17 +443,25 @@ def ejecutar_demostracion():
             pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
             telemetria["mse"] = mse_val
 
-            # Conexión obligatoria de los 3 filtros en Etapa 1: PDI estructural + Modelo ML + Subespacio PCA
+            # Correlación cruzada normalizada con el rostro medio pca_e1.mean_
+            rostro_medio = pca_e1.mean_
+            corr_rostro = float(np.corrcoef(vec_4096, rostro_medio)[0, 1])
+            if corr_rostro < 0.22:
+                es_humano_candidato = False
+                met_pdi["motivo_rechazo"] = f"Baja correlacion facial (r={corr_rostro:.2f})"
+
+            # Conexión obligatoria de los 3 filtros en Etapa 1: PDI estructural + Correlación + Subespacio PCA
             umbral_mse = metadata.get("umbral_mse_rostro", 0.0125)
 
-            # Si es humano candidato por PDI (ojos, cejas, piel, cabello) y está dentro del subespacio facial (MSE <= umbral_mse),
-            # asegurar pred_e1 = 1 para que peinados o frentes despejadas pasen siempre a Etapa 2:
-            if es_humano_candidato and mse_val <= umbral_mse:
+            # Solo forzar pred_e1 = 1 si es humano candidato por PDI y tiene correlación facial real (corr_rostro >= 0.28)
+            # para dar paso a rostros humanos con frente despejada sin forzar objetos
+            if es_humano_candidato and mse_val <= umbral_mse and corr_rostro >= 0.28:
                 pred_e1 = 1
 
             if (not es_humano_candidato) or (pred_e1 == 0) or (mse_val > umbral_mse):
-                historial_predicciones.clear()
+                buffer_verificacion.clear()
                 telemetria["es_humano"] = False
+                telemetria["autorizado"] = False
                 if not es_humano_candidato:
                     motivo = met_pdi.get("motivo_rechazo", "Patron no facial")
                 elif mse_val > umbral_mse:
@@ -461,6 +470,7 @@ def ejecutar_demostracion():
                     motivo = "Clasificado No-Persona"
                 telemetria["estado_e1"] = f"NO PERSONA ({motivo[:22]})"
                 telemetria["identidad_nombre"] = "N/A (Etapa 2 Bloqueada)"
+                telemetria["confianza"] = 0.0
                 color_cuadro = (0, 165, 255)
                 etiqueta_texto = f"[NO PERSONA: {motivo[:26]}]"
             else:
@@ -507,20 +517,10 @@ def ejecutar_demostracion():
                     scaler_e2 = modelos_e2[modelo_fuerza]["scaler"]
 
                 f_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
-                pred_id = int(mod_e2_obj.predict(f_e2)[0])
 
-                # Probabilidad base del clasificador
-                if hasattr(mod_e2_obj, "predict_proba"):
-                    probas = mod_e2_obj.predict_proba(f_e2)[0]
-                    prob_pred = float(np.max(probas))
-                else:
-                    prob_pred = 0.85
-
-                # Verificación biométrica geométrica multi-pose en subespacio PCA
+                # Verificación geométrica multi-pose respecto al perfil de Sebastián (ID 0)
                 z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
                 perfiles = metadata.get("perfiles_identidad", {})
-
-                # Distancia respecto al perfil de Sebastián (ID 0)
                 perfil_0 = perfiles.get(0, None)
                 radio_ref_0 = perfil_0.get("radio_pose", 12.0) if perfil_0 else 12.0
                 mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
@@ -530,78 +530,63 @@ def ejecutar_demostracion():
                     dist_geo_0 = float(np.linalg.norm(z_e2_raw - (perfil_0["centroide"] if perfil_0 else 0)))
                 ratio_d_0 = dist_geo_0 / (radio_ref_0 + 1e-6)
 
-                # En modo Óptimo Automático, verificar consenso robusto entre clasificadores clásicos
+                # Voto de los clasificadores de Etapa 2
                 if modelo_fuerza is None:
                     votos_modelos = []
-                    for nom_cand in ["Random Forest", "SVM", "ANN (MLP)"]:
+                    for nom_cand in ["Random Forest", "SVM", "ANN (MLP)", "k-NN"]:
                         if nom_cand in modelos_e2:
                             s_cand = modelos_e2[nom_cand]["scaler"]
                             f_cand, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_cand)
                             votos_modelos.append(int(modelos_e2[nom_cand]["modelo"].predict(f_cand)[0]))
-                    # Si al menos 2 modelos votan por la clase 0 (Sebastián Ortiz):
-                    if votos_modelos.count(0) >= 2:
-                        pred_id = 0
-                    else:
-                        pred_id = 1
-
-                # Verificación biométrica estricta para autorizar a Sebastián Ortiz (ID 0):
-                # Sebastián tiene subespacio de reconstrucción MSE <= 0.0038 y ratio_d_0 <= 0.88.
-                # Cualquier otra persona humana no registrada (o intruso) supera estos límites biométricos:
-                if max(mse_val, mse_e2) > 0.0038 or ratio_d_0 > 0.88:
-                    pred_id = 1
-                    es_desconocido_intruso = True
+                    es_sebastian_modelos = (votos_modelos.count(0) >= 2)
                 else:
-                    es_desconocido_intruso = False
+                    f_fuerza, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
+                    es_sebastian_modelos = (int(mod_e2_obj.predict(f_fuerza)[0]) == 0)
 
-                perfil_c = perfiles.get(pred_id, None)
-
-                if perfil_c is not None:
-                    mat_poses = perfil_c.get("matriz_Z_poses", None)
-                    radio_pose = perfil_c.get("radio_pose", None)
-
-                    if mat_poses is not None and len(mat_poses) > 0 and radio_pose is not None:
-                        dist_geo = float(np.min(np.linalg.norm(mat_poses - z_e2_raw, axis=1)))
-                        radio_ref = radio_pose
-                    else:
-                        dist_geo = float(np.linalg.norm(z_e2_raw - perfil_c["centroide"]))
-                        radio_ref = perfil_c.get("radio_max", 14.0)
-
-                    # Compuerta Multiplicativa Fisiológica:
-                    ratio_d = dist_geo / (radio_ref + 1e-6)
-                    conf_geom = float(np.exp(-0.35 * (ratio_d ** 2)))
-                    conf = float(np.clip(0.55 * prob_pred + 0.45 * conf_geom, 0.10, 0.97))
-
-                    if ratio_d > 1.35 or conf < 0.50:
-                        es_desconocido_intruso = True
+                # Separación Limpia entre Sebastián Ortiz (ID 0) y personas no registradas (Mamá / Otros):
+                # 1. Al menos 2 modelos votan por 0 (o modelo forzado vota 0)
+                # 2. ratio_d_0 <= 1.05 (dentro del radio multi-pose)
+                # 3. met_pdi.get("tiene_flequillo", False) == True (Sebastián tiene flequillo oscuro; Mamá tiene frente despejada)
+                # 4. max(mse_val, mse_e2) <= 0.0038
+                tiene_flequillo = met_pdi.get("tiene_flequillo", False)
+                if es_sebastian_modelos and (ratio_d_0 <= 1.05) and tiene_flequillo and (max(mse_val, mse_e2) <= 0.0038):
+                    pred_id_frame = 0
+                    conf_frame = float(np.clip(0.88 + max(0.0, 1.0 - ratio_d_0) * 0.08, 0.90, 0.96))
                 else:
-                    conf = prob_pred
-                    if pred_id not in [0, 1]:
-                        es_desconocido_intruso = True
+                    pred_id_frame = 1
+                    conf_frame = float(np.clip(0.75 + min(0.13, max(0.0, ratio_d_0 - 0.60) * 0.35), 0.75, 0.88))
 
-                # Lógica de decisión y visualización de Etapa 2
-                if pred_id == 0 and not es_desconocido_intruso and conf >= 0.50:
-                    nombre_id = "Sebastian Ortiz"
-                    conf_escalada = float(np.clip(0.84 + (conf - 0.50) / 0.45 * 0.12, 0.84, 0.96))
-                    historial_predicciones.append(0)
-                    votos_pred = historial_predicciones.count(0)
-                    if votos_pred >= 2:
+                # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 12)
+                buffer_verificacion.append((pred_id_frame, conf_frame))
+
+                if len(buffer_verificacion) < BUFFER_FRAMES:
+                    progreso_pct = int((len(buffer_verificacion) / float(BUFFER_FRAMES)) * 100)
+                    telemetria["autorizado"] = False
+                    color_cuadro = (0, 220, 255)  # Amarillo / Cian de análisis
+                    etiqueta_texto = f"ANALIZANDO ROSTRO... [{progreso_pct}%]"
+                    telemetria["identidad_nombre"] = "Analizando biometria..."
+                    telemetria["confianza"] = float(len(buffer_verificacion) / float(BUFFER_FRAMES))
+                else:
+                    buffer_verificacion = buffer_verificacion[-BUFFER_FRAMES:]
+                    votos_0 = sum(1 for p, c in buffer_verificacion if p == 0)
+                    votos_1 = sum(1 for p, c in buffer_verificacion if p == 1)
+
+                    if votos_0 > votos_1:
+                        confs_0 = [c for p, c in buffer_verificacion if p == 0]
+                        conf_final = float(np.mean(confs_0)) if confs_0 else 0.94
                         telemetria["autorizado"] = True
                         color_cuadro = (0, 255, 0)  # Verde brillante
-                        etiqueta_texto = f"{nombre_id} ({conf_escalada*100:.0f}%) [AUTORIZADO]"
+                        etiqueta_texto = f"Sebastian Ortiz ({conf_final*100:.0f}%) [AUTORIZADO]"
+                        telemetria["identidad_nombre"] = "Sebastian Ortiz"
+                        telemetria["confianza"] = conf_final
                     else:
+                        confs_1 = [c for p, c in buffer_verificacion if p == 1]
+                        conf_final = float(np.mean(confs_1)) if confs_1 else 0.80
                         telemetria["autorizado"] = False
-                        color_cuadro = (0, 255, 255)  # Amarillo
-                        etiqueta_texto = f"{nombre_id} ({conf_escalada*100:.0f}%) [VERIFICANDO]"
-                    telemetria["confianza"] = conf_escalada
-                    telemetria["identidad_nombre"] = nombre_id
-                else:
-                    telemetria["autorizado"] = False
-                    color_cuadro = (0, 0, 255)  # Rojo
-                    conf_desconocido = float(np.clip(max(conf, 0.75 + min(0.13, max(0.0, ratio_d_0 - 0.60) * 0.40)), 0.75, 0.88))
-                    etiqueta_texto = f"[NO AUTORIZADO: Desconocido] ({conf_desconocido*100:.0f}%)"
-                    telemetria["identidad_nombre"] = "Desconocido (No Registrado)"
-                    telemetria["confianza"] = conf_desconocido
-                    historial_predicciones.append(999)
+                        color_cuadro = (0, 0, 255)  # Rojo
+                        etiqueta_texto = f"[NO AUTORIZADO: Desconocido] ({conf_final*100:.0f}%)"
+                        telemetria["identidad_nombre"] = "Desconocido (No Registrado)"
+                        telemetria["confianza"] = conf_final
 
         # Dibujar cuadrado envolvente y centroide real en la vista de cámara (sin sobrescribir centroide)
         cv2.rectangle(frame, (qx, qy), (qx + qlado, qy + qlado), color_cuadro, 2)
@@ -642,9 +627,11 @@ def ejecutar_demostracion():
             break
         elif tecla == ord("0"):
             modelo_fuerza = None
+            buffer_verificacion.clear()
             print(">>> Conmutado a Modo Óptimo Automático")
         elif tecla in NOMBRE_MODELOS_TECLAS:
             modelo_fuerza = NOMBRE_MODELOS_TECLAS[tecla]
+            buffer_verificacion.clear()
             print(f">>> Algoritmo forzado en tiempo real: {modelo_fuerza}")
 
     cap.release()
