@@ -465,7 +465,9 @@ def analizar_morfologia_ventana_otsu(parche_bgr: np.ndarray):
     """
     Cálculo morfológico puro de clase dentro de la ventana de interés:
     1. Conversión a gris + mitigación de ruido (Mediana 3x3).
-    2. Binarización de Otsu (cv2.THRESH_OTSU).
+    2. Binarización de Otsu invertida (THRESH_BINARY_INV + THRESH_OTSU)
+       con máscara elíptica para segmentar los rasgos faciales/objeto (ojos, cejas, nariz, boca)
+       y excluir la pared clara en los bordes.
     3. Sellado morfológico de cavidades internas con imfill_holes (cv2.floodFill).
     4. Propiedades de región (regionprops): Área, Perímetro, Centroide y BoundingBox
        calculados con momentos espaciales de la componente conexa principal.
@@ -475,19 +477,37 @@ def analizar_morfologia_ventana_otsu(parche_bgr: np.ndarray):
     else:
         gris = parche_bgr.copy()
 
+    h_p, w_p = gris.shape[:2]
+
     # Mitigación de ruido de cátedra
     gris_filtrado = cv2.medianBlur(gris, 3)
 
-    # Binarización de Otsu
+    # Binarización de Otsu invertida (segmenta rasgos faciales/objeto oscuros)
     _, bw_otsu = cv2.threshold(
-        gris_filtrado, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        gris_filtrado, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
+
+    # Máscara elíptica centrada para concentrar el análisis en el rostro/objeto y eliminar pared exterior
+    mask_elipse = np.zeros((h_p, w_p), dtype=np.uint8)
+    cv2.ellipse(
+        mask_elipse,
+        (w_p // 2, h_p // 2),
+        (int(w_p * 0.35), int(h_p * 0.46)),
+        0,
+        0,
+        360,
+        255,
+        -1,
+    )
+    bw_otsu = cv2.bitwise_and(bw_otsu, mask_elipse)
 
     # Inundación morfológica imfill(BW, 'holes')
     bw_rellena = imfill_holes(bw_otsu)
 
     # Extracción de propiedades geométricas (regionprops)
     props = extraer_regionprops_basico(bw_rellena)
+    if props["area"] < 1.0:
+        props["centroide"] = (float(w_p // 2), float(h_p // 2))
 
     return {
         "bw_otsu": bw_otsu,

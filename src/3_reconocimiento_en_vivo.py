@@ -358,7 +358,6 @@ def ejecutar_demostracion():
     BUFFER_FRAMES = 6
     buffer_verificacion = []  # Almacena tuplas (pred_id, conf) durante los fotogramas válidos
     progreso_apertura = 0.0  # 0.0 cerrado, 1.0 completamente abierta
-    qx_prev, qy_prev = None, None
 
     print("\nCámara web iniciada satisfactoriamente.")
     print("Use las teclas [0] a [5] para conmutar modelos en caliente según las preguntas del docente.")
@@ -373,20 +372,10 @@ def ejecutar_demostracion():
         frame = cv2.flip(frame, 1)
         H, W = frame.shape[:2]
 
-        # EVALUACIÓN DIRECTA POR VENTANA GEOMÉTRICA DE CÁTEDRA CON AUTO-CENTRADO DINÁMICO
-        # Recorta exactamente de cejas a mentón y se auto-centra ágilmente sobre el rostro del usuario.
-        cuadrado_base, _ = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.38)
-        cuadrado_centrado = centrar_ventana_en_rostro_pdi(frame, cuadrado_base, max_shift=75)
-        qx_t, qy_t, qlado, _ = cuadrado_centrado
-
-        # Suavizado exponencial (0.50 / 0.50) para seguimiento ágil y fluido del rostro
-        if qx_prev is None:
-            qx, qy = qx_t, qy_t
-        else:
-            qx = int(0.50 * qx_prev + 0.50 * qx_t)
-            qy = int(0.50 * qy_prev + 0.50 * qy_t)
-        qx_prev, qy_prev = qx, qy
-
+        # RECUADRO VISUAL 100% FIJO Y CENTRADO EN PANTALLA (factor_central=0.40)
+        # Idéntico a 1_adquisicion_datos.py: jamás se desplaza, esquiva objetos ni se desalinea
+        cuadrado_base, _ = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.40)
+        qx, qy, qlado, _ = cuadrado_base
         parche = frame[qy : qy + qlado, qx : qx + qlado]
 
         # Análisis morfológico puro (Otsu + imfill + regionprops) para telemetría
@@ -428,13 +417,27 @@ def ejecutar_demostracion():
         if parche.shape[0] >= 32 and parche.shape[1] >= 32:
             img_64, vec_4096 = preprocesar_ventana_64x64(parche)
 
-            # Filtro 1: Validación PDI Estructural (Paredes lisas / Pantallas saturadas / Asimetría)
+            # Filtro 1: Validación PDI Estructural sobre parche en posición fija (0, 0)
             es_humano_candidato, met_pdi = verificar_estructura_facial_pdi(parche, img_64)
 
-            # Micro-alineamiento multi-posición ANTES de Etapa 1 y Etapa 2:
-            # Si pasa la validación humana básica o candidato, busca el mejor micro-recorte
-            # entre [(0, 0), (-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6)] (y np.fliplr)
-            # que minimice dist_geo_0 para alinear de forma óptima las facciones faciales.
+            # Si (0, 0) falla por un leve desfase lateral/vertical, verificar si algún desplazamiento corto cumple
+            if not es_humano_candidato:
+                for dx_c, dy_c in [(-10, 0), (10, 0), (0, -8), (0, 8)]:
+                    y_c = int(np.clip(qy + dy_c, 0, H - qlado))
+                    x_c = int(np.clip(qx + dx_c, 0, W - qlado))
+                    parche_c = frame[y_c : y_c + qlado, x_c : x_c + qlado]
+                    if parche_c.shape[0] == qlado and parche_c.shape[1] == qlado:
+                        img_c, vec_c = preprocesar_ventana_64x64(parche_c)
+                        ok_c, met_c = verificar_estructura_facial_pdi(parche_c, img_c)
+                        if ok_c:
+                            es_humano_candidato = True
+                            met_pdi = met_c
+                            vec_4096 = vec_c
+                            break
+
+            # Alineamiento Interno Multi-Posición (invisible al usuario) previo a Etapa 1 y Etapa 2:
+            # Selecciona entre los desplazamientos internos [(0, 0), (-12, 0), (12, 0), (0, -10), (0, 10), (-8, -8), (8, 8)]
+            # (y su reflejo np.fliplr) aquel vector vec_s que minimice dist_geo_0 con respecto a matriz_Z_poses
             perfil_0 = metadata.get("perfiles_identidad", {}).get(0, None)
             mat_poses_0 = perfil_0.get("matriz_Z_poses", None) if perfil_0 else None
 
@@ -443,7 +446,7 @@ def ejecutar_demostracion():
                 mejor_vec_4096 = vec_4096
                 mejor_met_pdi = met_pdi
 
-                for dx_s, dy_s in [(0, 0), (-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6)]:
+                for dx_s, dy_s in [(0, 0), (-12, 0), (12, 0), (0, -10), (0, 10), (-8, -8), (8, 8)]:
                     y_s = int(np.clip(qy + dy_s, 0, H - qlado))
                     x_s = int(np.clip(qx + dx_s, 0, W - qlado))
                     parche_s = frame[y_s : y_s + qlado, x_s : x_s + qlado]
