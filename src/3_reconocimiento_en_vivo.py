@@ -155,6 +155,46 @@ def extraer_vector_caracteristicas_vivo(pca_model, vector_4096: np.ndarray, scal
     return f, float(mse[0, 0])
 
 
+def construir_entrada_modelo(info_mod: dict, pca_model, vec_4096: np.ndarray, f_conv_cache=None, scaler_pca_fallback=None):
+    """
+    Construye automáticamente el vector de entrada exacto que espera cualquier modelo
+    (159/147 para modelos clásicos PCA, 2271/2259 para CNN con fusión PCA+Conv2D, o 2112 para Conv2D puro),
+    verificando modelo.n_features_in_ para que jamás ocurra un ValueError de dimensiones.
+    """
+    modelo = info_mod["modelo"]
+    scaler_pca = info_mod.get("scaler", None)
+    if scaler_pca is None or (hasattr(scaler_pca, "n_features_in_") and scaler_pca.n_features_in_ == 2112):
+        scaler_pca = scaler_pca_fallback
+
+    scaler_cnn = info_mod.get("scaler_cnn", None)
+
+    f_pca, mse_val = extraer_vector_caracteristicas_vivo(pca_model, vec_4096, scaler_pca)
+    n_esperado = getattr(modelo, "n_features_in_", f_pca.shape[1])
+
+    # Caso 1: Modelo clásico sobre PCA + PDI (159 en Etapa 1 o 147 en Etapa 2)
+    if n_esperado == f_pca.shape[1]:
+        return f_pca, mse_val, f_conv_cache
+
+    # Si requiere mapas convolucionales 2D (2112 características)
+    if f_conv_cache is None:
+        f_conv_cache = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
+
+    if scaler_cnn is not None:
+        f_conv_s = scaler_cnn.transform(f_conv_cache)
+    elif info_mod.get("scaler") is not None and hasattr(info_mod["scaler"], "n_features_in_") and info_mod["scaler"].n_features_in_ == 2112:
+        f_conv_s = info_mod["scaler"].transform(f_conv_cache)
+    else:
+        f_conv_s = f_conv_cache
+
+    # Caso 2: Modelo CNN con Fusión Profunda [f_pca, f_conv_s * 0.35] (2271 en Etapa 1 o 2259 en Etapa 2)
+    if n_esperado == (f_pca.shape[1] + f_conv_s.shape[1]):
+        f_total = np.hstack([f_pca, f_conv_s * 0.35])
+        return f_total, mse_val, f_conv_cache
+
+    # Caso 3: Modelo CNN solo sobre los 2112 mapas convolucionales
+    return f_conv_s, mse_val, f_conv_cache
+
+
 def obtener_vector_probabilidades(modelo, features, num_clases: int) -> np.ndarray:
     """
     Obtiene el vector de probabilidades de pertenencia a cada clase para cualquier
@@ -519,32 +559,19 @@ def ejecutar_demostracion():
                             break
 
             # Determinar clasificador activo para Etapa 1
-            es_modo_cnn = (modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"])
             if modelo_fuerza is None:
-                mod_e1_obj = artefactos["mejor_e1_info"]["modelo"]
-                scaler_e1 = artefactos["mejor_e1_info"]["scaler"]
-            elif es_modo_cnn:
-                mod_e1_obj = None
-                scaler_e1 = None
+                info_e1_activo = artefactos["mejor_e1_info"]
+            elif modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"]:
+                info_e1_activo = artefactos.get("modelo_cnn_e1", artefactos["mejor_e1_info"])
             else:
-                mod_e1_obj = modelos_e1.get(modelo_fuerza, artefactos["mejor_e1_info"])["modelo"]
-                scaler_e1 = modelos_e1.get(modelo_fuerza, artefactos["mejor_e1_info"])["scaler"]
+                info_e1_activo = modelos_e1.get(modelo_fuerza, artefactos["mejor_e1_info"])
 
-            f_e1, mse_val = extraer_vector_caracteristicas_vivo(pca_e1, vec_4096, scaler_e1)
-
-            if es_modo_cnn and artefactos.get("modelo_cnn_e1") is not None:
-                m_c1 = artefactos["modelo_cnn_e1"]
-                s_cnn1 = m_c1.get("scaler_cnn", m_c1.get("scaler"))
-                s_pca1 = m_c1.get("scaler", artefactos["mejor_e1_info"]["scaler"])
-                f_conv1 = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                f_conv1_s = s_cnn1.transform(f_conv1) * 0.35
-                f_pca1_s, mse_val = extraer_vector_caracteristicas_vivo(pca_e1, vec_4096, s_pca1)
-                f_cnn1_total = np.hstack([f_pca1_s, f_conv1_s])
-                pred_e1 = int(m_c1["modelo"].predict(f_cnn1_total)[0])
-            elif mod_e1_obj is not None:
-                pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
-            else:
-                pred_e1 = int(artefactos["mejor_e1_info"]["modelo"].predict(f_e1)[0])
+            scaler_pca_respaldo_e1 = modelos_e1.get("SVM", {}).get("scaler", None)
+            f_conv_cache = None
+            f_in_e1, mse_val, f_conv_cache = construir_entrada_modelo(
+                info_e1_activo, pca_e1, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e1
+            )
+            pred_e1 = int(info_e1_activo["modelo"].predict(f_in_e1)[0])
             telemetria["mse"] = mse_val
 
             # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
@@ -623,71 +650,55 @@ def ejecutar_demostracion():
 
                 ultimo_vec_4096 = vec_4096
                 ultimo_img_64 = img_64
+                f_conv_cache = None  # Resetear cache para la ventana seleccionada por la pirámide
 
                 # Determinar clasificador activo para Etapa 2
-                es_modo_cnn = (modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"])
-                if modelo_fuerza is None:
-                    mod_e2_obj = artefactos["mejor_e2_info"]["modelo"]
-                    scaler_e2 = artefactos["mejor_e2_info"]["scaler"]
-                elif es_modo_cnn:
-                    mod_e2_obj = None
-                    scaler_e2 = None
-                else:
-                    mod_e2_obj = modelos_e2[modelo_fuerza]["modelo"]
-                    scaler_e2 = modelos_e2[modelo_fuerza]["scaler"]
-
-                f_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
+                scaler_pca_respaldo_e2 = modelos_e2.get("SVM", {}).get("scaler", None)
+                _, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_pca_respaldo_e2)
                 num_clases_totales = max(nombres_e2.keys()) + 1
 
-                if es_modo_cnn:
-                    if modelo_cnn is not None:
-                        clf_cnn = modelo_cnn["modelo"]
-                        s_cnn2 = modelo_cnn.get("scaler_cnn", modelo_cnn.get("scaler"))
-                        s_pca2 = modelo_cnn.get("scaler", artefactos["mejor_e2_info"]["scaler"])
-                        f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                        f_conv_s = s_cnn2.transform(f_conv) * 0.35
-                        f_pca2_s, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_pca2)
-                        f_cnn2_total = np.hstack([f_pca2_s, f_conv_s])
-                        v_p = obtener_vector_probabilidades(clf_cnn, f_cnn2_total, num_clases_totales)
-                        pred_id = int(np.argmax(v_p))
-                        prob_pred = float(np.max(v_p))
-                    else:
-                        pred_id = int(artefactos["mejor_e2_info"]["modelo"].predict(f_e2)[0])
-                        prob_pred = 0.85
-                elif modelo_fuerza is None:
-                    # Modo Óptimo Automático: promediar vectores de probabilidad
+                if modelo_fuerza is None:
+                    # Modo Óptimo Automático: promediar vectores de probabilidad entre los modelos del consenso
                     lista_probas = []
-                    for nom_cand in ["SVM", "Random Forest", "ANN (MLP)", "k-NN"]:
+                    modelos_consenso = ["SVM", "Random Forest", "ANN (MLP)", "k-NN", "CNN (Conv2D)"]
+                    for nom_cand in modelos_consenso:
+                        cand_info = None
                         if nom_cand in modelos_e2:
-                            s_cand = modelos_e2[nom_cand]["scaler"]
-                            f_cand, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_cand)
-                            v_p = obtener_vector_probabilidades(modelos_e2[nom_cand]["modelo"], f_cand, num_clases_totales)
-                            lista_probas.append(v_p)
+                            cand_info = modelos_e2[nom_cand]
+                        elif nom_cand == "CNN (Conv2D)" and modelo_cnn is not None:
+                            cand_info = modelo_cnn
 
-                    # Incluir también el voto de la CNN si está disponible
-                    if modelo_cnn is not None:
-                        try:
-                            clf_cnn = modelo_cnn["modelo"]
-                            s_cnn2 = modelo_cnn.get("scaler_cnn", modelo_cnn.get("scaler"))
-                            s_pca2 = modelo_cnn.get("scaler", artefactos["mejor_e2_info"]["scaler"])
-                            f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                            f_conv_s = s_cnn2.transform(f_conv) * 0.35
-                            f_pca2_s, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_pca2)
-                            f_cnn2_total = np.hstack([f_pca2_s, f_conv_s])
-                            v_cnn = obtener_vector_probabilidades(clf_cnn, f_cnn2_total, num_clases_totales)
-                            lista_probas.append(v_cnn)
-                        except Exception:
-                            pass
+                        if cand_info is not None:
+                            try:
+                                f_in_cand, _, f_conv_cache = construir_entrada_modelo(
+                                    cand_info, pca_e2, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e2
+                                )
+                                v_p = obtener_vector_probabilidades(cand_info["modelo"], f_in_cand, num_clases_totales)
+                                lista_probas.append(v_p)
+                            except Exception:
+                                pass
 
                     if lista_probas:
                         probas_promedio = np.mean(lista_probas, axis=0)
                         pred_id = int(np.argmax(probas_promedio))
                         prob_pred = float(np.max(probas_promedio))
                     else:
-                        pred_id = int(mod_e2_obj.predict(f_e2)[0])
+                        f_in_def, _, _ = construir_entrada_modelo(
+                            artefactos["mejor_e2_info"], pca_e2, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e2
+                        )
+                        pred_id = int(artefactos["mejor_e2_info"]["modelo"].predict(f_in_def)[0])
                         prob_pred = 0.85
                 else:
-                    v_p = obtener_vector_probabilidades(mod_e2_obj, f_e2, num_clases_totales)
+                    # Algoritmo forzado por teclado ([1] a [6])
+                    if modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"]:
+                        info_e2_activo = modelo_cnn if modelo_cnn is not None else modelos_e2.get("CNN (Conv2D)", artefactos["mejor_e2_info"])
+                    else:
+                        info_e2_activo = modelos_e2.get(modelo_fuerza, artefactos["mejor_e2_info"])
+
+                    f_in_e2, _, f_conv_cache = construir_entrada_modelo(
+                        info_e2_activo, pca_e2, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e2
+                    )
+                    v_p = obtener_vector_probabilidades(info_e2_activo["modelo"], f_in_e2, num_clases_totales)
                     pred_id = int(np.argmax(v_p))
                     prob_pred = float(np.max(v_p))
 
