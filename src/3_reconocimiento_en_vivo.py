@@ -56,7 +56,7 @@ NOMBRE_MODELOS_TECLAS = {
     ord("3"): "Random Forest",
     ord("4"): "SVM",
     ord("5"): "ANN (MLP)",
-    ord("6"): "CNN (Deep Learning)",
+    ord("6"): "CNN (Conv2D)",
 }
 
 
@@ -91,15 +91,20 @@ def cargar_artefactos():
 
     metadata = joblib.load(os.path.join(DIR_MODELOS, "metadata_clases.pkl"))
 
-    # Cargar CNN de la Fase Posterior si existe
+    # Cargar CNN profunda de Etapa 2 si existe
     ruta_cnn = os.path.join(DIR_MODELOS, "etapa2_cnn_profunda.pkl")
     modelo_cnn = None
     if os.path.exists(ruta_cnn):
         try:
             modelo_cnn = joblib.load(ruta_cnn)
-            print("[INFO] Modelo CNN (Deep Learning) cargado para inferencia en tiempo real.")
+            print("[INFO] Modelo CNN (Conv2D) cargado para inferencia en tiempo real.")
         except Exception as e:
             print(f"[AVISO] No se pudo cargar etapa2_cnn_profunda.pkl: {e}")
+
+    if modelo_cnn is None and "CNN (Conv2D)" in modelos_e2:
+        modelo_cnn = modelos_e2["CNN (Conv2D)"]
+
+    modelo_cnn_e1 = modelos_e1.get("CNN (Conv2D)", None)
 
     return {
         "pca_e1": pca_e1,
@@ -111,6 +116,7 @@ def cargar_artefactos():
         "mejor_e2_nombre": mejor_e2["nombre"],
         "mejor_e2_info": mejor_e2["info"],
         "modelo_cnn": modelo_cnn,
+        "modelo_cnn_e1": modelo_cnn_e1,
         "metadata": metadata,
     }
 
@@ -513,15 +519,28 @@ def ejecutar_demostracion():
                             break
 
             # Determinar clasificador activo para Etapa 1
-            if modelo_fuerza is None or modelo_fuerza == "CNN (Deep Learning)":
+            es_modo_cnn = (modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"])
+            if modelo_fuerza is None:
                 mod_e1_obj = artefactos["mejor_e1_info"]["modelo"]
                 scaler_e1 = artefactos["mejor_e1_info"]["scaler"]
+            elif es_modo_cnn:
+                mod_e1_obj = None
+                scaler_e1 = None
             else:
-                mod_e1_obj = modelos_e1[modelo_fuerza]["modelo"]
-                scaler_e1 = modelos_e1[modelo_fuerza]["scaler"]
+                mod_e1_obj = modelos_e1.get(modelo_fuerza, artefactos["mejor_e1_info"])["modelo"]
+                scaler_e1 = modelos_e1.get(modelo_fuerza, artefactos["mejor_e1_info"])["scaler"]
 
             f_e1, mse_val = extraer_vector_caracteristicas_vivo(pca_e1, vec_4096, scaler_e1)
-            pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
+
+            if es_modo_cnn and artefactos.get("modelo_cnn_e1") is not None:
+                m_c1 = artefactos["modelo_cnn_e1"]
+                f_c1 = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
+                f_c1_s = m_c1["scaler"].transform(f_c1)
+                pred_e1 = int(m_c1["modelo"].predict(f_c1_s)[0])
+            elif mod_e1_obj is not None:
+                pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
+            else:
+                pred_e1 = int(artefactos["mejor_e1_info"]["modelo"].predict(f_e1)[0])
             telemetria["mse"] = mse_val
 
             # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
@@ -602,10 +621,11 @@ def ejecutar_demostracion():
                 ultimo_img_64 = img_64
 
                 # Determinar clasificador activo para Etapa 2
+                es_modo_cnn = (modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"])
                 if modelo_fuerza is None:
                     mod_e2_obj = artefactos["mejor_e2_info"]["modelo"]
                     scaler_e2 = artefactos["mejor_e2_info"]["scaler"]
-                elif modelo_fuerza == "CNN (Deep Learning)":
+                elif es_modo_cnn:
                     mod_e2_obj = None
                     scaler_e2 = None
                 else:
@@ -615,7 +635,7 @@ def ejecutar_demostracion():
                 f_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_e2)
                 num_clases_totales = max(nombres_e2.keys()) + 1
 
-                if modelo_fuerza == "CNN (Deep Learning)":
+                if es_modo_cnn:
                     if modelo_cnn is not None:
                         clf_cnn = modelo_cnn["modelo"]
                         scaler_cnn = modelo_cnn["scaler"]

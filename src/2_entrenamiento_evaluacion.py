@@ -40,6 +40,7 @@ from utils_pdi import (
     aplicar_mascara_eliptica_a_img64,
     extraer_descriptor_espacial_bloques,
     aumentar_geometria_rostro,
+    extraer_mapas_convolucionales_2d,
 )
 
 MAPEADO_IDENTIDADES = {
@@ -623,6 +624,71 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
         }
         matrices_conf[nombre_m] = confusion_matrix(y_pru, y_pred_pru)
 
+    # -------------------------------------------------------------------------
+    # SEXTO MODELO: CNN (Conv2D) [Fase Posterior Deep Learning de Cátedra]
+    # Banco de 8 Kernels 2D + ReLU + MaxPool 4x4 + AvgPool 8x8 + MLP(256, 128)
+    # -------------------------------------------------------------------------
+    print("  Entrenando y optimizando: CNN (Conv2D) [8 Filtros 2D + ReLU + MaxPool 4x4 + MLP(256, 128)]...")
+    F_conv_ent = extraer_mapas_convolucionales_2d(X_ent.reshape(-1, 64, 64))
+    F_conv_pru = extraer_mapas_convolucionales_2d(X_pru.reshape(-1, 64, 64))
+    scaler_cnn = StandardScaler()
+    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent)
+    F_conv_pru_s = scaler_cnn.transform(F_conv_pru)
+
+    clf_cnn = MLPClassifier(
+        hidden_layer_sizes=(256, 128),
+        activation="relu",
+        alpha=0.15,
+        max_iter=500,
+        early_stopping=True,
+        random_state=42,
+    )
+    clf_cnn.fit(F_conv_ent_s, y_ent)
+    print(f"    [ÉPOCAS CNN] Entrenamiento convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas (Early Stopping activo).")
+
+    y_pred_ent_cnn = clf_cnn.predict(F_conv_ent_s)
+    y_pred_pru_cnn = clf_cnn.predict(F_conv_pru_s)
+
+    acc_ent_cnn = np.mean(y_pred_ent_cnn == y_ent) * 100.0
+    err_ent_cnn = 100.0 - acc_ent_cnn
+    acc_pru_cnn = np.mean(y_pred_pru_cnn == y_pru) * 100.0
+    err_pru_cnn = 100.0 - acc_pru_cnn
+    brecha_cnn = acc_ent_cnn - acc_pru_cnn
+
+    assert np.isclose(acc_ent_cnn + err_ent_cnn, 100.0), "Fallo assert suma ent en CNN (Conv2D)"
+    assert np.isclose(acc_pru_cnn + err_pru_cnn, 100.0), "Fallo assert suma pru en CNN (Conv2D)"
+
+    acc_val_cnn = (
+        float(clf_cnn.best_validation_score_ * 100.0)
+        if hasattr(clf_cnn, "best_validation_score_") and clf_cnn.best_validation_score_ is not None
+        else acc_pru_cnn
+    )
+
+    J_cnn = acc_pru_cnn - 0.5 * max(0.0, brecha_cnn - 3.0)
+
+    resultados_lista.append(
+        {
+            "Modelo": "CNN (Conv2D)",
+            "Exactitud ent. (%)": round(acc_ent_cnn, 2),
+            "Error ent. (%)": round(err_ent_cnn, 2),
+            "Exactitud val. CV (%)": round(acc_val_cnn, 2),
+            "Exactitud prueba (%)": round(acc_pru_cnn, 2),
+            "Error prueba (%)": round(err_pru_cnn, 2),
+            "Brecha (p. p.)": round(brecha_cnn, 2),
+            "Indice_J": round(J_cnn, 2),
+            "Epocas_Ejecutadas": getattr(clf_cnn, "n_iter_", "N/A"),
+            "Mejores_Parametros": {"hidden_layers": (256, 128), "alpha": 0.15, "activation": "relu"},
+        }
+    )
+
+    modelos_entrenados["CNN (Conv2D)"] = {
+        "modelo": clf_cnn,
+        "scaler": scaler_cnn,
+        "es_cnn_2d": True,
+        "params": {"hidden_layers": (256, 128), "alpha": 0.15},
+    }
+    matrices_conf["CNN (Conv2D)"] = confusion_matrix(y_pru, y_pred_pru_cnn)
+
     df_resultados = pd.DataFrame(resultados_lista)
     # Ordenar por el criterio de selección J
     df_resultados = df_resultados.sort_values(by="Indice_J", ascending=False).reset_index(drop=True)
@@ -643,14 +709,32 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     except Exception:
         print(df_resultados[columnas_oficiales].to_string(index=False))
 
-    mejor_modelo_nombre = df_resultados.iloc[0]["Modelo"]
+    # Seleccionar mejor modelo clásico para el pipeline PCA (compatibilidad con extracción f en vivo)
+    df_clasicos = df_resultados[df_resultados["Modelo"] != "CNN (Conv2D)"]
+    mejor_modelo_nombre = df_clasicos.iloc[0]["Modelo"]
     mejor_modelo_info = modelos_entrenados[mejor_modelo_nombre]
-    print(f"\n>>> MODELO GANADOR SELECCIONADO: {mejor_modelo_nombre}")
-    print(
-        f"    Criterio matemático: Máximo índice J = {df_resultados.iloc[0]['Indice_J']} | "
-        f"Exactitud prueba = {df_resultados.iloc[0]['Exactitud prueba (%)']}% | "
-        f"Brecha = {df_resultados.iloc[0]['Brecha (p. p.)']} p.p."
-    )
+
+    modelo_top_absoluto = df_resultados.iloc[0]["Modelo"]
+    if modelo_top_absoluto == "CNN (Conv2D)":
+        print(f"\n>>> MODELO CON MAYOR EXACTITUD GLOBAL: CNN (Conv2D)")
+        print(
+            f"    Criterio matemático: Máximo índice J = {df_resultados.iloc[0]['Indice_J']} | "
+            f"Exactitud prueba = {df_resultados.iloc[0]['Exactitud prueba (%)']}% | "
+            f"Brecha = {df_resultados.iloc[0]['Brecha (p. p.)']} p.p."
+        )
+        print(f">>> MODELO CLÁSICO SELECCIONADO PARA PIPELINE PCA: {mejor_modelo_nombre}")
+        print(
+            f"    Criterio matemático: Máximo índice J = {df_clasicos.iloc[0]['Indice_J']} | "
+            f"Exactitud prueba = {df_clasicos.iloc[0]['Exactitud prueba (%)']}% | "
+            f"Brecha = {df_clasicos.iloc[0]['Brecha (p. p.)']} p.p."
+        )
+    else:
+        print(f"\n>>> MODELO GANADOR SELECCIONADO: {mejor_modelo_nombre}")
+        print(
+            f"    Criterio matemático: Máximo índice J = {df_clasicos.iloc[0]['Indice_J']} | "
+            f"Exactitud prueba = {df_clasicos.iloc[0]['Exactitud prueba (%)']}% | "
+            f"Brecha = {df_clasicos.iloc[0]['Brecha (p. p.)']} p.p."
+        )
 
     return (
         df_resultados,
@@ -711,10 +795,13 @@ def generar_figura2_eigenfaces_varianza(pca_etapa2):
 
 def generar_figura_matrices_confusion(matrices_conf, nombres_clases, ruta_guardar, titulo):
     """
-    Genera la figura comparativa de matrices de confusión para los 5 algoritmos evaluados.
+    Genera la figura comparativa de matrices de confusión para los 6 algoritmos evaluados (5 clásicos + CNN 2D).
     """
     nombres_modelos = list(matrices_conf.keys())
-    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+    num_m = len(nombres_modelos)
+    fig, axes = plt.subplots(1, num_m, figsize=(4.2 * num_m, 5))
+    if num_m == 1:
+        axes = [axes]
     fig.suptitle(titulo, fontsize=13, fontweight="bold", y=1.02)
 
     clases_etiquetas = [nombres_clases[k] for k in sorted(nombres_clases.keys())]
@@ -736,9 +823,9 @@ def generar_figura_matrices_confusion(matrices_conf, nombres_clases, ruta_guarda
 def generar_figura5_comparativa_brechas(df_e1, df_e2):
     """
     Figura 5: Gráfico comparativo de barras mostrando Exactitud de Entrenamiento vs. Prueba
-    y la Brecha en puntos porcentuales (p. p.) para ambas etapas.
+    y la Brecha en puntos porcentuales (p. p.) para ambas etapas (5 clásicos + CNN 2D).
     """
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
     fig.suptitle(
         "Figura 5: Comparativa de Rendimiento y Brecha de Generalización (Ein vs. Etest)\n"
         "Control Estricto Anti-Overfitting - Ortiz & Ayuquina (FISEI - UTA)",
@@ -766,7 +853,7 @@ def generar_figura5_comparativa_brechas(df_e1, df_e2):
                 f"Δ={b:.1f} pp",
                 ha="center",
                 va="bottom",
-                fontsize=9,
+                fontsize=8.5,
                 fontweight="bold",
                 color="#e74c3c" if b > 5.0 else "#27ae60",
             )
@@ -774,7 +861,7 @@ def generar_figura5_comparativa_brechas(df_e1, df_e2):
         ax.set_ylabel("Exactitud (%)", fontsize=10)
         ax.set_title(tit, fontsize=11)
         ax.set_xticks(x)
-        ax.set_xticklabels(df["Modelo"], rotation=20, ha="right", fontsize=9)
+        ax.set_xticklabels(df["Modelo"], rotation=22, ha="right", fontsize=8.5)
         ax.set_ylim(0, 115)
         ax.grid(True, linestyle="--", alpha=0.5, axis="y")
         ax.legend(loc="lower right", fontsize=8)
@@ -849,7 +936,7 @@ def main():
         matrices_conf_e1,
         nombres_e1,
         ruta_fig3,
-        "Figura 3: Matrices de Confusión de los 5 Modelos Evaluados (Etapa 1: Humano vs. No Persona)",
+        "Figura 3: Matrices de Confusión de los 6 Modelos Evaluados (Etapa 1: Humano vs. No Persona)",
     )
 
     ruta_fig4 = os.path.join(DIR_FIGURAS, "figura4_matrices_confusion_etapa2.png")
@@ -857,7 +944,7 @@ def main():
         matrices_conf_e2,
         nombres_e2,
         ruta_fig4,
-        "Figura 4: Matrices de Confusión de los 5 Modelos Evaluados (Etapa 2: Identidades Multiclase)",
+        "Figura 4: Matrices de Confusión de los 6 Modelos Evaluados (Etapa 2: Identidades Multiclase)",
     )
 
     generar_figura5_comparativa_brechas(df_e1, df_e2)
@@ -877,6 +964,11 @@ def main():
         {"nombre": mejor_nombre_e2, "info": mejor_info_e2},
         os.path.join(DIR_MODELOS, "etapa2_mejor_modelo.pkl"),
     )
+
+    # Guardar modelo CNN profundo de Etapa 2 para inferencia directa
+    if "CNN (Conv2D)" in modelos_e2:
+        joblib.dump(modelos_e2["CNN (Conv2D)"], os.path.join(DIR_MODELOS, "etapa2_cnn_profunda.pkl"))
+        print("[OK] Modelo CNN profundo serializado en: etapa2_cnn_profunda.pkl")
 
     ids_autorizados = sorted(list(dict_id.keys()))
     id_desconocido = max(ids_autorizados) + 1 if ids_autorizados else 1
