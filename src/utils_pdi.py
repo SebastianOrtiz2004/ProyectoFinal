@@ -752,8 +752,8 @@ def centrar_ventana_en_rostro_pdi(frame_bgr: np.ndarray, cuadrado_base: list, ma
 def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.ndarray):
     """
     Validación Antropométrica Universal en Zona-T y PDI Estructural (Etapa 1):
-    - Reconoce el rostro frontal y medio perfil de Sebastián sin obligarlo a bajar la cabeza.
-    - Bloquea manos/dedos abiertos (image_5c1001.jpg), muñecos (image_5c0f49.jpg), puños y paredes.
+    - Reconoce rostros humanos frontales y con ángulos naturales de forma fluida.
+    - Bloquea manos laterales, muñecos con tintes artificiales, puños y paredes vacías.
     """
     if len(parche_bgr.shape) != 3:
         return True, {"motivo_rechazo": "", "sim_bilateral": 1.0}
@@ -792,7 +792,7 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
         if corr_v > 0.90:
             return False, {"motivo_rechazo": "Estructura vertical continua (Puerta/Pared)", "sim_bilateral": 0.0}
 
-    # 4. SIMETRÍA BILATERAL ESTRICTA (Bloquea media mano a la derecha + puerta/pared a la izquierda en image_5c1001.jpg):
+    # 4. SIMETRÍA BILATERAL Y DIFERENCIA FOTOMÉTRICA (Permite luz lateral realista pero bloquea media mano lateral):
     mitad_izq = gris[14:50, 12:32]
     mitad_der = gris[14:50, 32:52]
     diff_brillo_lados = abs(float(np.mean(mitad_izq)) - float(np.mean(mitad_der)))
@@ -800,36 +800,37 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     std_der = float(np.std(mitad_der)) * 255.0
     sim_espejo = 1.0 - float(np.mean(np.abs(mitad_izq - np.fliplr(mitad_der))))
 
-    if diff_brillo_lados > 0.15 or min(std_izq, std_der) < 8.0 or sim_espejo < 0.72:
+    # Bloquea media mano lateral (diff > 0.25 y sim < 0.55), tolerando sombras e iluminación lateral natural
+    if diff_brillo_lados > 0.24 or min(std_izq, std_der) < 6.5 or sim_espejo < 0.62:
         return False, {"motivo_rechazo": "Asimetria Izq-Der (Mano lateral / Pared)", "sim_bilateral": sim_espejo}
 
-    # 5. Cajas oculares sobre gris CRUDO (Acepta el rostro frontal completo de Sebastián):
+    # 5. Cajas oculares sobre gris CRUDO:
     ojo_izq = gris[14:36, 14:31]
     ojo_der = gris[14:36, 33:50]
-    if min(float(np.std(ojo_izq)), float(np.std(ojo_der))) * 255.0 < 7.5:
+    if min(float(np.std(ojo_izq)), float(np.std(ojo_der))) * 255.0 < 6.5:
         return False, {"motivo_rechazo": "Zona ocular lisa sin ojos (Pared/Fondo)", "sim_bilateral": sim_espejo}
 
     gy_izq = float(np.mean(np.abs(cv2.Sobel(ojo_izq, cv2.CV_64F, 0, 1, ksize=3))))
     gx_izq = float(np.mean(np.abs(cv2.Sobel(ojo_izq, cv2.CV_64F, 1, 0, ksize=3))))
     gy_der = float(np.mean(np.abs(cv2.Sobel(ojo_der, cv2.CV_64F, 0, 1, ksize=3))))
     gx_der = float(np.mean(np.abs(cv2.Sobel(ojo_der, cv2.CV_64F, 1, 0, ksize=3))))
-    if min(gy_izq, gy_der) < 0.020 or (gy_izq + gy_der) < 0.58 * (gx_izq + gx_der + 1e-6):
+    if min(gy_izq, gy_der) < 0.016 or (gy_izq + gy_der) < 0.52 * (gx_izq + gx_der + 1e-6):
         return False, {"motivo_rechazo": "Dedos verticales / Sin cejas horizontales", "sim_bilateral": sim_espejo}
 
-    # Usamos percentil 10 (pupilas/pestañas/cejas) sobre gris crudo para que NUNCA rechace a Sebastián de frente:
+    # Usamos percentil 10 sobre gris crudo (pupilas/pestañas/cejas oscuras)
     mediana_mejillas = float(np.median(gris[24:46, 14:50]))
     p10_izq = float(np.percentile(ojo_izq, 10))
     p10_der = float(np.percentile(ojo_der, 10))
-    if max(p10_izq, p10_der) > max(0.48, mediana_mejillas * 0.90):
+    if max(p10_izq, p10_der) > max(0.48, mediana_mejillas * 0.92):
         return False, {"motivo_rechazo": "Sin pupilas/cejas oscuras (Mano/Puno)", "sim_bilateral": sim_espejo}
 
     # 6. Presencia de nariz y boca en el tercio inferior:
-    zona_boca = gris[34:54, 20:44]
+    zona_boca = gris[34:54, 18:46]
     gy_boca = float(np.mean(np.abs(cv2.Sobel(zona_boca, cv2.CV_64F, 0, 1, ksize=3))))
-    if gy_boca < 0.020 or (float(np.percentile(zona_boca, 88)) - float(np.percentile(zona_boca, 12))) < 0.09:
+    if gy_boca < 0.016 or (float(np.percentile(zona_boca, 88)) - float(np.percentile(zona_boca, 12))) < 0.08:
         return False, {"motivo_rechazo": "Sin nariz ni labios inferiores (Mano/Puno)", "sim_bilateral": sim_espejo}
 
-    # 7. Piel humana obligatoria en AMBAS mejillas Y en el puente nasal central (Bloquea image_5c1001.jpg):
+    # 7. Piel humana bilateral en ambas mejillas y puente nasal:
     p95 = float(np.percentile(gris, 95))
     gain = np.clip(0.75 / max(p95, 0.15), 1.0, 2.0)
     R_n = np.clip(R * gain, 0, 1)
@@ -838,14 +839,16 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     gris_n = np.clip(gris * gain, 0, 1)
     bw_piel = (
         (R_n > 0.20) & (G_n > 0.11) & (B_n > 0.07)
-        & ((R_n - G_n) >= 0.005) & ((R_n - G_n) <= 0.36)
-        & ((R_n - B_n) >= 0.015)
-        & (gris_n > 0.20) & (gris_n < 0.86)
+        & ((R_n - G_n) >= 0.005) & ((R_n - G_n) <= 0.38)
+        & ((R_n - B_n) >= 0.012)
+        & (gris_n > 0.18) & (gris_n < 0.88)
     )
     piel_izq = float(np.mean(bw_piel[24:48, 14:31]))
     piel_der = float(np.mean(bw_piel[24:48, 33:50]))
-    piel_nariz = float(np.mean(bw_piel[22:44, 26:38]))
-    if min(piel_izq, piel_der) < 0.28 or piel_nariz < 0.38:
+    piel_nariz = float(np.mean(bw_piel[20:46, 24:40]))
+    piel_total = float(np.mean(bw_piel[20:48, 16:48]))
+
+    if min(piel_izq, piel_der) < 0.20 or piel_nariz < 0.26 or piel_total < 0.25:
         return False, {"motivo_rechazo": "Sin piel simetrica en ambas mejillas y nariz", "sim_bilateral": sim_espejo}
 
     return True, {"sim_bilateral": sim_espejo, "motivo_rechazo": ""}
