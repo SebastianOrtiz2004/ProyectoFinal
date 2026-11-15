@@ -456,18 +456,19 @@ def definir_modelos_y_grillas():
     return clasificadores
 
 
-def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
+def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_reales=None):
     """
     Ejecuta el ciclo experimental completo para una etapa:
     1. Partición 80/20 en bloques de 10 imágenes consecutivas (8 a entrenamiento y 2 a prueba).
     2. Perturbación suave y simétrica de sensor (sigma = 0.012 con filtro gaussiano 3x3).
-    3. PCA 97% varianza calibrado:
+    3. PCA 95% varianza calibrado (espacio libre de ruido de alta frecuencia):
        - En Etapa 1: calibrado EXCLUSIVAMENTE sobre rostros humanos (y_ent == 1).
        - En Etapa 2: calibrado sobre identidades de entrenamiento.
     4. Extracción de f = [z_PCA, MSE, Sim_Adapt, Ratio_HV] en R^(K+3).
     5. Escalado que preserva la varianza relativa de las Eigenfaces para todos los modelos.
-    6. GridSearchCV con StratifiedKFold(n_splits=5).
-    7. Cálculo de umbral_mse_rostro y perfiles multi-pose de identidad (250 prototipos en matriz_Z_poses).
+    6. GridSearchCV con StratifiedKFold(n_splits=5) para los 5 algoritmos clásicos.
+    7. Modelo Convolucional Profundo CNN (Conv2D) con Fusión Espectral y paciencia ampliada.
+    8. Cálculo de umbral_mse_rostro y perfiles multi-pose de identidad (250 prototipos reales).
     """
     print(f"\n{'=' * 75}\nEJECUTANDO: {nombre_etapa.upper()}\n{'=' * 75}")
 
@@ -494,8 +495,8 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
 
     print(f"Dimensiones de matrices: X_ent={X_ent.shape}, X_pru={X_pru.shape}")
 
-    # PCA con retención del 97% de la varianza explicada acumulada
-    pca = PCA(n_components=0.97, whiten=False, random_state=42)
+    # PCA con retención del 95% de la varianza explicada acumulada (~70 Eigenfaces sin ruido de alta frecuencia)
+    pca = PCA(n_components=0.95, whiten=False, random_state=42)
     if "Etapa 1" in nombre_etapa:
         # Subespacio Facial Exclusivo de Rostros Humanos
         pca.fit(X_ent[y_ent == 1])
@@ -505,7 +506,7 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     F_ent, mse_ent = extraer_caracteristicas_pca_mse(pca, X_ent)
     F_pru, mse_pru = extraer_caracteristicas_pca_mse(pca, X_pru)
     K = pca.n_components_
-    print(f"Componentes PCA retenidas (varianza >= 97%): K = {K}")
+    print(f"Componentes PCA retenidas (varianza >= 95%): K = {K}")
     print(f"Dimensión del vector final f ∈ R^(K+3): {F_ent.shape[1]}")
 
     # Escalador que preserva la relación de autovalores de Eigenfaces
@@ -524,20 +525,26 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
         Z_ent_pca = pca.transform(X_ent)
         for c in np.unique(y_ent):
             idx_c = (y_ent == c)
-            Z_c = Z_ent_pca[idx_c]
-            mu_c = np.mean(Z_c, axis=0)
-            dists_c = np.linalg.norm(Z_c - mu_c, axis=1)
+            # Matriz de poses calculada SOLO sobre fotos reales originales para máxima pureza
+            if dict_fotos_reales is not None and int(c) in dict_fotos_reales:
+                data_real_c = dict_fotos_reales[int(c)]
+                Z_c_poses = pca.transform(data_real_c)
+            else:
+                Z_c_poses = Z_ent_pca[idx_c]
+
+            mu_c = np.mean(Z_c_poses, axis=0)
+            dists_c = np.linalg.norm(Z_c_poses - mu_c, axis=1)
             radio_c = float(np.percentile(dists_c, 98) * 1.40)
             dist_media = float(np.mean(dists_c))
 
-            # Matriz de referencia matriz_Z_poses con 250 prototipos representativos multi-pose
-            idx_p = np.linspace(0, len(Z_c) - 1, min(250, len(Z_c)), dtype=int)
-            matriz_Z_poses = Z_c[idx_p]
+            # Matriz de referencia matriz_Z_poses con 250 prototipos representativos multi-pose sobre fotos reales
+            idx_p = np.linspace(0, len(Z_c_poses) - 1, min(250, len(Z_c_poses)), dtype=int)
+            matriz_Z_poses = Z_c_poses[idx_p]
 
             from sklearn.neighbors import NearestNeighbors
             nn_poses = NearestNeighbors(n_neighbors=min(12, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
-            dists_min_pose, _ = nn_poses.kneighbors(Z_c)
-            radio_pose = float(np.percentile(dists_min_pose[:, -1], 95) * 1.25)
+            dists_min_pose, _ = nn_poses.kneighbors(Z_c_poses)
+            radio_pose = float(np.percentile(dists_min_pose[:, -1], 96) * 1.45)
 
             perfiles_identidad[int(c)] = {
                 "centroide": mu_c,
@@ -547,16 +554,16 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
                 "dist_media": dist_media,
             }
             nom_c = nombres_clases.get(int(c), f"ID {c}") if nombres_clases else f"ID {c}"
-            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} (250 prototipos), Dist media={dist_media:.3f}")
+            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} (250 prototipos reales), Dist media={dist_media:.3f}")
         datos_adicionales["perfiles_identidad"] = perfiles_identidad
 
         # Umbral de reconstrucción MSE para identidades autorizadas (excluyendo id_desconocido)
         id_desc = max(perfiles_identidad.keys())
         mask_autorizados = (y_ent != id_desc)
         if np.any(mask_autorizados):
-            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent[mask_autorizados], 96) * 1.35))
+            umbral_mse_identidad = float(max(0.0055, np.percentile(mse_ent[mask_autorizados], 98) * 1.60))
         else:
-            umbral_mse_identidad = float(max(0.0040, np.percentile(mse_ent, 96) * 1.35))
+            umbral_mse_identidad = float(max(0.0055, np.percentile(mse_ent, 98) * 1.60))
         datos_adicionales["umbral_mse_identidad"] = umbral_mse_identidad
         print(f"  [BIOMETRIA] Umbral MSE Identidad Calibrado Dinámicamente: {umbral_mse_identidad:.5f}")
 
@@ -628,26 +635,35 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     # SEXTO MODELO: CNN (Conv2D) [Fase Posterior Deep Learning de Cátedra]
     # Banco de 8 Kernels 2D + ReLU + MaxPool 4x4 + AvgPool 8x8 + MLP(256, 128)
     # -------------------------------------------------------------------------
-    print("  Entrenando y optimizando: CNN (Conv2D) [8 Filtros 2D + ReLU + MaxPool 4x4 + MLP(256, 128)]...")
+    # SEXTO MODELO: CNN (Conv2D) [Fase Posterior Deep Learning de Cátedra]
+    # Banco de 8 Kernels 2D + ReLU + MaxPool 4x4 + AvgPool 8x8 + Fusión Espectral PCA
+    # -------------------------------------------------------------------------
+    print("  Entrenando y optimizando: CNN (Conv2D) [8 Filtros 2D + MaxPool 4x4 + Fusión Espectral PCA + MLP(256, 128)]...")
     F_conv_ent = extraer_mapas_convolucionales_2d(X_ent.reshape(-1, 64, 64))
     F_conv_pru = extraer_mapas_convolucionales_2d(X_pru.reshape(-1, 64, 64))
     scaler_cnn = StandardScaler()
-    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent)
-    F_conv_pru_s = scaler_cnn.transform(F_conv_pru)
+    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent) * 0.35
+    F_conv_pru_s = scaler_cnn.transform(F_conv_pru) * 0.35
+
+    F_cnn_total_ent = np.hstack([F_ent_scaled, F_conv_ent_s])
+    F_cnn_total_pru = np.hstack([F_pru_scaled, F_conv_pru_s])
 
     clf_cnn = MLPClassifier(
         hidden_layer_sizes=(256, 128),
         activation="relu",
-        alpha=0.15,
+        alpha=0.08,
+        learning_rate_init=0.001,
         max_iter=500,
         early_stopping=True,
+        n_iter_no_change=25,
+        validation_fraction=0.12,
         random_state=42,
     )
-    clf_cnn.fit(F_conv_ent_s, y_ent)
-    print(f"    [ÉPOCAS CNN] Entrenamiento convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas (Early Stopping activo).")
+    clf_cnn.fit(F_cnn_total_ent, y_ent)
+    print(f"    [ÉPOCAS CNN] Entrenamiento convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas (Early Stopping con paciencia 25).")
 
-    y_pred_ent_cnn = clf_cnn.predict(F_conv_ent_s)
-    y_pred_pru_cnn = clf_cnn.predict(F_conv_pru_s)
+    y_pred_ent_cnn = clf_cnn.predict(F_cnn_total_ent)
+    y_pred_pru_cnn = clf_cnn.predict(F_cnn_total_pru)
 
     acc_ent_cnn = np.mean(y_pred_ent_cnn == y_ent) * 100.0
     err_ent_cnn = 100.0 - acc_ent_cnn
@@ -677,15 +693,16 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
             "Brecha (p. p.)": round(brecha_cnn, 2),
             "Indice_J": round(J_cnn, 2),
             "Epocas_Ejecutadas": getattr(clf_cnn, "n_iter_", "N/A"),
-            "Mejores_Parametros": {"hidden_layers": (256, 128), "alpha": 0.15, "activation": "relu"},
+            "Mejores_Parametros": {"hidden_layers": (256, 128), "alpha": 0.08, "paciencia": 25},
         }
     )
 
     modelos_entrenados["CNN (Conv2D)"] = {
         "modelo": clf_cnn,
-        "scaler": scaler_cnn,
+        "scaler": scaler,
+        "scaler_cnn": scaler_cnn,
         "es_cnn_2d": True,
-        "params": {"hidden_layers": (256, 128), "alpha": 0.15},
+        "params": {"hidden_layers": (256, 128), "alpha": 0.08},
     }
     matrices_conf["CNN (Conv2D)"] = confusion_matrix(y_pru, y_pred_pru_cnn)
 
@@ -709,31 +726,27 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
     except Exception:
         print(df_resultados[columnas_oficiales].to_string(index=False))
 
-    # Seleccionar mejor modelo clásico para el pipeline PCA (compatibilidad con extracción f en vivo)
-    df_clasicos = df_resultados[df_resultados["Modelo"] != "CNN (Conv2D)"]
-    mejor_modelo_nombre = df_clasicos.iloc[0]["Modelo"]
+    mejor_modelo_nombre = df_resultados.iloc[0]["Modelo"]
     mejor_modelo_info = modelos_entrenados[mejor_modelo_nombre]
 
-    modelo_top_absoluto = df_resultados.iloc[0]["Modelo"]
-    if modelo_top_absoluto == "CNN (Conv2D)":
-        print(f"\n>>> MODELO CON MAYOR EXACTITUD GLOBAL: CNN (Conv2D)")
+    df_clasicos = df_resultados[df_resultados["Modelo"] != "CNN (Conv2D)"]
+    mejor_clasico_nombre = df_clasicos.iloc[0]["Modelo"]
+    mejor_clasico_info = modelos_entrenados[mejor_clasico_nombre]
+
+    if mejor_modelo_nombre == "CNN (Conv2D)":
+        print(f"\n>>> MODELO GANADOR SELECCIONADO: CNN (Conv2D)")
         print(
             f"    Criterio matemático: Máximo índice J = {df_resultados.iloc[0]['Indice_J']} | "
             f"Exactitud prueba = {df_resultados.iloc[0]['Exactitud prueba (%)']}% | "
             f"Brecha = {df_resultados.iloc[0]['Brecha (p. p.)']} p.p."
         )
-        print(f">>> MODELO CLÁSICO SELECCIONADO PARA PIPELINE PCA: {mejor_modelo_nombre}")
-        print(
-            f"    Criterio matemático: Máximo índice J = {df_clasicos.iloc[0]['Indice_J']} | "
-            f"Exactitud prueba = {df_clasicos.iloc[0]['Exactitud prueba (%)']}% | "
-            f"Brecha = {df_clasicos.iloc[0]['Brecha (p. p.)']} p.p."
-        )
+        print(f">>> MODELO CLÁSICO SELECCIONADO PARA PIPELINE PCA: {mejor_clasico_nombre} (Prueba: {df_clasicos.iloc[0]['Exactitud prueba (%)']}%)")
     else:
         print(f"\n>>> MODELO GANADOR SELECCIONADO: {mejor_modelo_nombre}")
         print(
-            f"    Criterio matemático: Máximo índice J = {df_clasicos.iloc[0]['Indice_J']} | "
-            f"Exactitud prueba = {df_clasicos.iloc[0]['Exactitud prueba (%)']}% | "
-            f"Brecha = {df_clasicos.iloc[0]['Brecha (p. p.)']} p.p."
+            f"    Criterio matemático: Máximo índice J = {df_resultados.iloc[0]['Indice_J']} | "
+            f"Exactitud prueba = {df_resultados.iloc[0]['Exactitud prueba (%)']}% | "
+            f"Brecha = {df_resultados.iloc[0]['Brecha (p. p.)']} p.p."
         )
 
     return (
@@ -745,6 +758,8 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None):
         matrices_conf,
         y_pru,
         datos_adicionales,
+        mejor_clasico_nombre,
+        mejor_clasico_info,
     )
 
 
@@ -883,6 +898,7 @@ def main():
 
     # 1. Cargar fuentes de datos
     X_oli, y_oli, X_fondo, dict_id, X_obj = cargar_dataset_completo()
+    dict_fotos_reales = {id_num: dict_id[id_num]["data"] for id_num in dict_id}
 
     # 2. Construir matrices para Etapa 1
     print("\n[2/6] Estructurando matrices de la Etapa 1 (Persona vs. No Persona)...")
@@ -899,6 +915,8 @@ def main():
         matrices_conf_e1,
         _,
         datos_e1,
+        mejor_clasico_e1,
+        mejor_clasico_info_e1,
     ) = evaluar_experimento("Etapa 1: Persona vs. No Persona", X_e1, y_e1, nombres_e1)
 
     # Exportar tabla CSV Etapa 1
@@ -920,7 +938,9 @@ def main():
         matrices_conf_e2,
         _,
         datos_e2,
-    ) = evaluar_experimento("Etapa 2: Reconocimiento de Identidad", X_e2, y_e2, nombres_e2)
+        mejor_clasico_e2,
+        mejor_clasico_info_e2,
+    ) = evaluar_experimento("Etapa 2: Reconocimiento de Identidad", X_e2, y_e2, nombres_e2, dict_fotos_reales=dict_fotos_reales)
 
     # Exportar tabla CSV Etapa 2
     ruta_csv_e2 = os.path.join(DIR_FIGURAS, "tabla_resultados_etapa2_identidad.csv")
@@ -954,14 +974,14 @@ def main():
     joblib.dump(pca_e1, os.path.join(DIR_MODELOS, "etapa1_pca_humano.pkl"))
     joblib.dump(modelos_e1, os.path.join(DIR_MODELOS, "etapa1_todos_modelos.pkl"))
     joblib.dump(
-        {"nombre": mejor_nombre_e1, "info": mejor_info_e1},
+        {"nombre": mejor_nombre_e1, "info": mejor_info_e1, "clasico_nombre": mejor_clasico_e1, "clasico_info": mejor_clasico_info_e1},
         os.path.join(DIR_MODELOS, "etapa1_mejor_modelo.pkl"),
     )
 
     joblib.dump(pca_e2, os.path.join(DIR_MODELOS, "etapa2_pca_identidad.pkl"))
     joblib.dump(modelos_e2, os.path.join(DIR_MODELOS, "etapa2_todos_modelos.pkl"))
     joblib.dump(
-        {"nombre": mejor_nombre_e2, "info": mejor_info_e2},
+        {"nombre": mejor_nombre_e2, "info": mejor_info_e2, "clasico_nombre": mejor_clasico_e2, "clasico_info": mejor_clasico_info_e2},
         os.path.join(DIR_MODELOS, "etapa2_mejor_modelo.pkl"),
     )
 
@@ -972,7 +992,7 @@ def main():
 
     ids_autorizados = sorted(list(dict_id.keys()))
     id_desconocido = max(ids_autorizados) + 1 if ids_autorizados else 1
-    umbral_mse_identidad = datos_e2.get("umbral_mse_identidad", 0.0040)
+    umbral_mse_identidad = datos_e2.get("umbral_mse_identidad", 0.0055)
 
     # Guardar metadatos y mapeos
     metadata = {
@@ -980,6 +1000,8 @@ def main():
         "nombres_e2": nombres_e2,
         "mejor_modelo_e1": mejor_nombre_e1,
         "mejor_modelo_e2": mejor_nombre_e2,
+        "mejor_clasico_e1": mejor_clasico_e1,
+        "mejor_clasico_e2": mejor_clasico_e2,
         "umbral_confianza_acceso": 0.62,
         "umbral_mse_rostro": datos_e1.get("umbral_mse_rostro", 0.0042),
         "perfiles_identidad": datos_e2.get("perfiles_identidad", {}),

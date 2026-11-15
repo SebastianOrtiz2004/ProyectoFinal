@@ -257,18 +257,9 @@ def aplicar_mascara_eliptica_a_img64(img_64_double: np.ndarray) -> np.ndarray:
     Aplica la máscara elíptica facial suave a una imagen de 64x64 en [0.0, 1.0]
     preservando intacto el contraste real del interior del rostro y neutralizando
     únicamente las 4 esquinas exteriores fuera de la elipse con un tono neutro (0.42).
-    Aplica normalización fotométrica intra-elipse si std_int > 0.045 para homogeneidad.
     """
     mascara = obtener_mascara_eliptica_64()
-    region_interna = mascara > 0.5
-    vals_internos = img_64_double[region_interna]
-    std_int = float(np.std(vals_internos))
-    img_base = img_64_double.copy()
-    if std_int > 0.045:
-        media_int = float(np.mean(vals_internos))
-        img_norm = (img_base - media_int) * (0.18 / (std_int + 1e-6)) + 0.48
-        img_base = np.clip(img_norm, 0.0, 1.0)
-    img_enmascarada = img_base * mascara + 0.42 * (1.0 - mascara)
+    img_enmascarada = img_64_double * mascara + 0.42 * (1.0 - mascara)
     return np.clip(img_enmascarada, 0.0, 1.0)
 
 
@@ -284,8 +275,7 @@ def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
            - Si std_cruda >= 12.0 (rostro real), aplica ecualización balanceada suave (0.6 eq + 0.4 gauss).
         5. Reducción espacial de cátedra por MEDIANA DE BLOQUE VECTORIZADA a 64x64.
         6. Conversión a precisión continua double en [0.0, 1.0].
-        7. Normalización fotométrica intra-elipse (media 0.48, std 0.18) si std_int > 0.045.
-        8. Aplicación obligatoria de máscara elíptica suave: elimina el fondo de las esquinas.
+        7. Aplicación obligatoria de máscara elíptica suave: neutraliza el fondo exterior con 0.42.
 
     Retorna:
         - img_64x64_double: Matriz np.ndarray de tamaño (64, 64) en np.float64.
@@ -318,18 +308,13 @@ def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
     # Conversión explícita a double [0.0, 1.0]
     img_64x64_base = np.clip(img_64x64_mediana / 255.0, 0.0, 1.0)
 
-    # Normalización fotométrica intra-elipse de cátedra
+    # Aplicación obligatoria de máscara elíptica suave: neutraliza el fondo exterior con 0.42
     mascara = obtener_mascara_eliptica_64()
-    region_interna = mascara > 0.5
-    vals_internos = img_64x64_base[region_interna]
-    std_int = float(np.std(vals_internos))
-    if std_int > 0.045:
-        media_int = float(np.mean(vals_internos))
-        img_norm = (img_64x64_base - media_int) * (0.18 / (std_int + 1e-6)) + 0.48
-        img_64x64_base = np.clip(img_norm, 0.0, 1.0)
     img_64x64_double = img_64x64_base * mascara + 0.42 * (1.0 - mascara)
     img_64x64_double = np.clip(img_64x64_double, 0.0, 1.0)
     vector_4096 = img_64x64_double.reshape(-1)
+
+    return img_64x64_double, vector_4096
 
     return img_64x64_double, vector_4096
 

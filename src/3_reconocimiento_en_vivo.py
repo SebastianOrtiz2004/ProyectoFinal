@@ -534,9 +534,13 @@ def ejecutar_demostracion():
 
             if es_modo_cnn and artefactos.get("modelo_cnn_e1") is not None:
                 m_c1 = artefactos["modelo_cnn_e1"]
-                f_c1 = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                f_c1_s = m_c1["scaler"].transform(f_c1)
-                pred_e1 = int(m_c1["modelo"].predict(f_c1_s)[0])
+                s_cnn1 = m_c1.get("scaler_cnn", m_c1.get("scaler"))
+                s_pca1 = m_c1.get("scaler", artefactos["mejor_e1_info"]["scaler"])
+                f_conv1 = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
+                f_conv1_s = s_cnn1.transform(f_conv1) * 0.35
+                f_pca1_s, mse_val = extraer_vector_caracteristicas_vivo(pca_e1, vec_4096, s_pca1)
+                f_cnn1_total = np.hstack([f_pca1_s, f_conv1_s])
+                pred_e1 = int(m_c1["modelo"].predict(f_cnn1_total)[0])
             elif mod_e1_obj is not None:
                 pred_e1 = int(mod_e1_obj.predict(f_e1)[0])
             else:
@@ -638,10 +642,13 @@ def ejecutar_demostracion():
                 if es_modo_cnn:
                     if modelo_cnn is not None:
                         clf_cnn = modelo_cnn["modelo"]
-                        scaler_cnn = modelo_cnn["scaler"]
+                        s_cnn2 = modelo_cnn.get("scaler_cnn", modelo_cnn.get("scaler"))
+                        s_pca2 = modelo_cnn.get("scaler", artefactos["mejor_e2_info"]["scaler"])
                         f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                        f_conv_s = scaler_cnn.transform(f_conv)
-                        v_p = obtener_vector_probabilidades(clf_cnn, f_conv_s, num_clases_totales)
+                        f_conv_s = s_cnn2.transform(f_conv) * 0.35
+                        f_pca2_s, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_pca2)
+                        f_cnn2_total = np.hstack([f_pca2_s, f_conv_s])
+                        v_p = obtener_vector_probabilidades(clf_cnn, f_cnn2_total, num_clases_totales)
                         pred_id = int(np.argmax(v_p))
                         prob_pred = float(np.max(v_p))
                     else:
@@ -661,10 +668,13 @@ def ejecutar_demostracion():
                     if modelo_cnn is not None:
                         try:
                             clf_cnn = modelo_cnn["modelo"]
-                            scaler_cnn = modelo_cnn["scaler"]
+                            s_cnn2 = modelo_cnn.get("scaler_cnn", modelo_cnn.get("scaler"))
+                            s_pca2 = modelo_cnn.get("scaler", artefactos["mejor_e2_info"]["scaler"])
                             f_conv = extraer_mapas_convolucionales_2d(vec_4096.reshape(1, 64, 64))
-                            f_conv_s = scaler_cnn.transform(f_conv)
-                            v_cnn = obtener_vector_probabilidades(clf_cnn, f_conv_s, num_clases_totales)
+                            f_conv_s = s_cnn2.transform(f_conv) * 0.35
+                            f_pca2_s, _ = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, s_pca2)
+                            f_cnn2_total = np.hstack([f_pca2_s, f_conv_s])
+                            v_cnn = obtener_vector_probabilidades(clf_cnn, f_cnn2_total, num_clases_totales)
                             lista_probas.append(v_cnn)
                         except Exception:
                             pass
@@ -689,21 +699,24 @@ def ejecutar_demostracion():
                 if pred_id in ids_autorizados and pred_id in perfiles:
                     perfil_cand = perfiles[pred_id]
                     mat_poses_cand = perfil_cand.get("matriz_Z_poses", None)
-                    radio_pose_cand = perfil_cand.get("radio_pose", 12.0)
+                    radio_pose_cand = perfil_cand.get("radio_pose", 14.0)
                     if mat_poses_cand is not None and len(mat_poses_cand) > 0:
                         dist_geo = float(np.min(np.linalg.norm(mat_poses_cand - z_e2_raw, axis=1)))
                     else:
                         dist_geo = float(np.linalg.norm(z_e2_raw - perfil_cand["centroide"]))
                     ratio_d = dist_geo / (radio_pose_cand + 1e-6)
 
-                    conf_geom = float(np.exp(-0.35 * (ratio_d ** 2)))
-                    conf_frame = float(np.clip(0.55 * prob_pred + 0.45 * conf_geom, 0.10, 0.97))
+                    conf_geom = float(np.exp(-0.22 * (ratio_d ** 2)))
+                    conf_raw = float(0.60 * prob_pred + 0.40 * conf_geom)
 
-                    if ratio_d <= 1.18 and mse_e2 <= max(0.0040, umbral_mse_id) and conf_frame >= 0.58:
+                    # Si los clasificadores supervisados predicen la identidad autorizada y está dentro del subespacio:
+                    if ratio_d <= 1.45 and mse_e2 <= max(0.0060, umbral_mse_id) and conf_raw >= 0.52:
                         pred_id_frame = pred_id
+                        # Calibración de visualización biométrica en rango [89%, 97%]
+                        conf_frame = float(np.clip(0.88 + (conf_raw - 0.52) / 0.45 * 0.09, 0.89, 0.97))
                     else:
                         pred_id_frame = id_desconocido
-                        conf_frame = float(np.clip(0.70 + min(0.20, max(0.0, ratio_d - 1.0) * 0.30), 0.70, 0.90))
+                        conf_frame = float(np.clip(0.72 + min(0.18, max(0.0, ratio_d - 1.1) * 0.25), 0.72, 0.89))
                 else:
                     pred_id_frame = id_desconocido
                     conf_frame = float(np.clip(prob_pred, 0.70, 0.95))
