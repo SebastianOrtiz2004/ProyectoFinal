@@ -630,12 +630,11 @@ def ejecutar_demostracion():
                 cx_base = qx + qlado // 2
                 cy_base = qy + qlado // 2
                 desplazamientos = [
-                    (0, 0), (-12, 0), (12, 0), (0, -12), (0, 12),
-                    (-24, 0), (24, 0), (0, -22), (0, 22),
-                    (-14, -14), (14, -14), (-14, 14), (14, 14),
-                    (-22, -14), (22, -14), (-22, 14), (22, 14),
+                    (0, 0), (-8, 0), (8, 0), (0, -8), (0, 8),
+                    (-15, 0), (15, 0), (0, -14), (0, 14),
+                    (-10, -10), (10, -10), (-10, 10), (10, 10),
                 ]
-                escalas = [0.88, 0.94, 1.00, 1.06, 1.12]
+                escalas = [0.94, 1.00, 1.06]
 
                 candidatos_lote = []
                 for dx_p, dy_p in desplazamientos:
@@ -654,21 +653,13 @@ def ejecutar_demostracion():
                 if not candidatos_lote:
                     candidatos_lote.append(vec_4096)
 
-                matrices_autorizados = [
-                    perfiles[c]["matriz_Z_poses"]
-                    for c in ids_autorizados
-                    if c in perfiles and perfiles[c].get("matriz_Z_poses") is not None and len(perfiles[c]["matriz_Z_poses"]) > 0
-                ]
-
-                if matrices_autorizados and candidatos_lote:
-                    X_lote = np.array(candidatos_lote, dtype=np.float64)
-                    Z_lote = pca_e2.transform(X_lote)  # Proyección matricial vectorizada en batch (< 3 ms)
-                    Z_prototipos = np.vstack(matrices_autorizados)
-                    dists_all = np.linalg.norm(Z_lote[:, None, :] - Z_prototipos[None, :, :], axis=2)
-                    dists_top5 = np.mean(np.sort(dists_all, axis=1)[:, :5], axis=1)
-                    best_idx = int(np.argmin(dists_top5))
-                    vec_4096 = X_lote[best_idx]
-                    img_64 = vec_4096.reshape(64, 64)
+                X_lote = np.array(candidatos_lote, dtype=np.float64)
+                Z_lote = pca_e2.transform(X_lote)
+                X_hat_lote = pca_e2.inverse_transform(Z_lote)
+                mse_lote = np.mean((X_lote - X_hat_lote) ** 2, axis=1)
+                best_idx = int(np.argmin(mse_lote))
+                vec_4096 = X_lote[best_idx]
+                img_64 = vec_4096.reshape(64, 64)
 
                 ultimo_vec_4096 = vec_4096
                 ultimo_img_64 = img_64
@@ -676,7 +667,10 @@ def ejecutar_demostracion():
 
                 # Determinar clasificador activo para Etapa 2
                 scaler_pca_respaldo_e2 = modelos_e2.get("SVM", {}).get("scaler", None)
-                _, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_pca_respaldo_e2)
+                f_pca_e2, mse_e2 = extraer_vector_caracteristicas_vivo(pca_e2, vec_4096, scaler_pca_respaldo_e2)
+                # Vector de identidad libre de las 2 primeras componentes de iluminación global del cuarto:
+                v_id_vivo = f_pca_e2[0, 2:]
+                ultimo_z_e2_raw = v_id_vivo
                 num_clases_totales = max(nombres_e2.keys()) + 1
 
                 if modelo_fuerza is None:
@@ -726,10 +720,7 @@ def ejecutar_demostracion():
                     pred_id = int(np.argmax(probas_vector))
                     prob_pred = float(np.max(probas_vector))
 
-                # Verificación Biométrica Dinámica en Subespacio PCA para todas las identidades autorizadas
-                z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
-                ultimo_z_e2_raw = z_e2_raw
-
+                # Verificación Biométrica Dinámica en el Subespacio de Identidad (sin dominancia de luz global)
                 mejor_c_aut = None
                 mejor_conf_raw = -1.0
                 mejor_ratio_d = 999.0
@@ -740,17 +731,17 @@ def ejecutar_demostracion():
                     if c_aut in perfiles:
                         p_cand = perfiles[c_aut]
                         mat_p = p_cand.get("matriz_Z_poses", None)
-                        rad_p = p_cand.get("radio_pose", 14.5)
-                        umb_m = p_cand.get("umbral_mse_clase", max(0.0052, umbral_mse_id))
-                        if mat_p is not None and len(mat_p) > 0:
-                            d_all = np.linalg.norm(mat_p - z_e2_raw, axis=1)
-                            d_geo = float(np.mean(np.sort(d_all)[:3]))
+                        rad_p = p_cand.get("radio_pose", 3.5)
+                        umb_m = p_cand.get("umbral_mse_clase", 0.0030)
+                        if mat_p is not None and len(mat_p) > 0 and mat_p.shape[1] == len(v_id_vivo):
+                            d_all = np.linalg.norm(mat_p - v_id_vivo, axis=1)
+                            d_geo = float(np.mean(np.sort(d_all)[:5]))
                         else:
-                            d_geo = float(np.linalg.norm(z_e2_raw - p_cand["centroide"]))
+                            d_geo = float(np.linalg.norm(v_id_vivo - p_cand["centroide"]))
                         r_d = d_geo / (rad_p + 1e-6)
-                        c_geom = float(np.exp(-0.20 * (r_d ** 2)))
+                        c_geom = float(np.exp(-0.35 * (r_d ** 2)))
                         prob_c = float(probas_vector[c_aut]) if c_aut < len(probas_vector) else 0.0
-                        c_raw = float(0.58 * prob_c + 0.42 * c_geom)
+                        c_raw = float(0.55 * prob_c + 0.45 * c_geom)
                         if c_raw > mejor_conf_raw:
                             mejor_conf_raw = c_raw
                             mejor_c_aut = c_aut
@@ -758,21 +749,24 @@ def ejecutar_demostracion():
                             mejor_umbral_mse = umb_m
                             prob_c_ganador = prob_c
 
-                # Autoriza dinámicamente a mejor_c_aut (hoy ID 0, mañana ID 0, 1, 2...) si cumple subespacio + ML:
+                # Condición estricta universal para autorizar a cualquier identidad registrada c_aut:
+                # 1) Mayoría real en el consenso de modelos ML (prob_c_ganador >= 0.54)
+                # 2) Dentro del radio de pose en el subespacio de identidad + Landmarks (mejor_ratio_d <= 1.05)
+                # 3) Error de reconstrucción MSE dentro del límite estadístico de esa clase (mse_e2 <= mejor_umbral_mse)
                 if (
                     mejor_c_aut is not None
-                    and prob_c_ganador >= 0.36
-                    and mejor_ratio_d <= 1.32
+                    and prob_c_ganador >= 0.54
+                    and mejor_ratio_d <= 1.05
                     and mse_e2 <= mejor_umbral_mse
-                    and mejor_conf_raw >= 0.50
+                    and mejor_conf_raw >= 0.56
                 ):
                     pred_id_frame = mejor_c_aut
                     ultimo_pred_id = mejor_c_aut
-                    conf_frame = float(np.clip(0.90 + (mejor_conf_raw - 0.50) / 0.45 * 0.07, 0.90, 0.97))
+                    conf_frame = float(np.clip(0.90 + (mejor_conf_raw - 0.56) / 0.40 * 0.07, 0.90, 0.97))
                 else:
                     pred_id_frame = id_desconocido
                     ultimo_pred_id = id_desconocido
-                    conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, mejor_ratio_d - 1.0) * 0.25), 0.75, 0.90))
+                    conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, mejor_ratio_d - 0.85) * 0.25), 0.75, 0.90))
 
                 # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 8)
                 buffer_verificacion.append((pred_id_frame, conf_frame))
@@ -903,12 +897,11 @@ def ejecutar_demostracion():
             if ultimo_z_e2_raw is not None:
                 target_id = ultimo_pred_id if (ultimo_pred_id in ids_autorizados) else (ids_autorizados[0] if ids_autorizados else 0)
                 if target_id in perfiles:
-                    z_flip = pca_e2.transform(np.fliplr(ultimo_img_64).reshape(1, -1))[0]
                     mat_p = perfiles[target_id].get("matriz_Z_poses", None)
-                    if mat_p is not None and len(mat_p) > 0:
-                        perfiles[target_id]["matriz_Z_poses"] = np.vstack([mat_p, ultimo_z_e2_raw, z_flip])
+                    if mat_p is not None and len(mat_p) > 0 and mat_p.shape[1] == len(ultimo_z_e2_raw):
+                        perfiles[target_id]["matriz_Z_poses"] = np.vstack([mat_p, ultimo_z_e2_raw])
                     else:
-                        perfiles[target_id]["matriz_Z_poses"] = np.array([ultimo_z_e2_raw, z_flip])
+                        perfiles[target_id]["matriz_Z_poses"] = np.array([ultimo_z_e2_raw])
                     nom_calib = nombres_e2.get(target_id, f"ID {target_id}")
                     print(f"[CALIBRACIÓN] Luz del aula calibrada: vector facial agregado a matriz_Z_poses de {nom_calib} con tecla [C].")
         elif tecla in [ord("n"), ord("N")]:

@@ -329,20 +329,30 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
     id_desconocido = max(dict_identidades.keys()) + 1 if dict_identidades else 1
     np.random.seed(42)
 
-    # 1. 800 rostros humanos de desconocidos (400 fotos de Olivetti + 400 aumentadas)
+    # 1. 800 rostros humanos de desconocidos (400 fotos de Olivetti + 400 aumentadas simulando encuadre de webcam)
     oli_desc = [X_olivetti]
     idx_oli_400 = np.random.choice(len(X_olivetti), size=400, replace=False)
     variaciones_desc = [
-        (-8, 0, 0.88, False), (8, 0, 0.94, False),
-        (0, -8, 0.82, False), (0, 8, 0.88, False),
-        (-6, 0, 0.82, True), (6, 0, 0.94, True),
-        (0, 0, 0.88, True), (0, 0, 0.82, False),
+        (-6, 2, 0.76, False), (6, 2, 0.80, False),
+        (0, 4, 0.74, False), (0, 3, 0.82, False),
+        (-5, 3, 0.78, True), (5, 3, 0.84, True),
+        (0, 2, 0.76, True), (0, 4, 0.80, True),
     ]
     oli_desc_aug = []
     for i, idx_o in enumerate(idx_oli_400):
-        img_o = X_olivetti[idx_o].reshape(64, 64)
+        img_o = X_olivetti[idx_o].reshape(64, 64).copy()
         dx, dy, sc, fl = variaciones_desc[i % len(variaciones_desc)]
         im_w = aumentar_geometria_rostro(img_o, dx=dx, dy=dy, scale=sc, flip=fl)
+        # En el 65% de las muestras desconocidas, simular marco craneal/cabello superior de webcam
+        # para eliminar el sesgo entre el recorte cerrado de Olivetti y el encuadre de webcam:
+        if i % 3 != 0:
+            yy, xx = np.mgrid[0:64, 0:64]
+            elipse_cara_int = (((xx - (32 + dx * 0.5)) / (20.0 * sc)) ** 2 + ((yy - (35 + dy * 0.5)) / (24.0 * sc)) ** 2)
+            mask_cabello_sup = (elipse_cara_int > 0.85) & (yy < 36)
+            tono_cab = 0.10 + 0.08 * (i % 3)
+            im_w[mask_cabello_sup] = np.minimum(im_w[mask_cabello_sup], tono_cab)
+            im_w = cv2.GaussianBlur(im_w, (3, 3), 0.6)
+            im_w = aplicar_mascara_eliptica_a_img64(im_w)
         oli_desc_aug.append(im_w.reshape(-1))
     oli_desc.append(np.array(oli_desc_aug, dtype=np.float64))
     X_humanos_desc = np.vstack(oli_desc)  # Exactamente 800 muestras
@@ -568,31 +578,36 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_real
         print(f"  [SUBESPACIO FACIAL] Umbral MSE de Reconstrucción Facial (Calibrado con margen dinámico): {umbral_mse_rostro:.5f}")
     elif "Etapa 2" in nombre_etapa:
         perfiles_identidad = {}
-        Z_ent_pca = pca.transform(X_ent)
         for c in np.unique(y_ent):
             idx_c = (y_ent == c)
-            # Matriz de poses calculada SOLO sobre fotos reales originales para máxima pureza
             if dict_fotos_reales is not None and int(c) in dict_fotos_reales:
                 data_real_c = dict_fotos_reales[int(c)]
-                Z_c_poses = pca.transform(data_real_c)
+                F_real_c, mse_real_c = extraer_caracteristicas_pca_mse(pca, data_real_c)
+                F_real_c_scaled = scaler.transform(F_real_c)
             else:
-                Z_c_poses = Z_ent_pca[idx_c]
+                F_real_c_scaled = F_ent_scaled[idx_c]
+                mse_real_c = mse_ent[idx_c]
 
-            mu_c = np.mean(Z_c_poses, axis=0)
-            dists_c = np.linalg.norm(Z_c_poses - mu_c, axis=1)
-            radio_c = float(np.percentile(dists_c, 98) * 1.40)
+            # Usar el subespacio biométrico libre de las 2 primeras componentes de iluminación de habitación:
+            # Incluye Eigenfaces 2..K + MSE + 78 descriptores PDI y Landmarks Faciales
+            V_id_c = F_real_c_scaled[:, 2:]
+
+            mu_c = np.mean(V_id_c, axis=0)
+            dists_c = np.linalg.norm(V_id_c - mu_c, axis=1)
+            radio_c = float(np.percentile(dists_c, 96) * 1.15)
             dist_media = float(np.mean(dists_c))
 
-            # Matriz de referencia matriz_Z_poses con hasta 300 prototipos representativos multi-pose sobre fotos reales
-            idx_p = np.linspace(0, len(Z_c_poses) - 1, min(300, len(Z_c_poses)), dtype=int)
-            matriz_Z_poses = Z_c_poses[idx_p]
+            idx_p = np.linspace(0, len(V_id_c) - 1, min(300, len(V_id_c)), dtype=int)
+            matriz_Z_poses = V_id_c[idx_p]
 
             from sklearn.neighbors import NearestNeighbors
-            nn_poses = NearestNeighbors(n_neighbors=min(12, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
-            dists_min_pose, _ = nn_poses.kneighbors(Z_c_poses)
-            radio_pose = float(np.percentile(dists_min_pose[:, -1], 97) * 1.45)
+            nn_poses = NearestNeighbors(n_neighbors=min(8, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
+            dists_min_pose, _ = nn_poses.kneighbors(V_id_c)
+            # Radio estricto sin sobre-inflación (1.12x del percentil 95 de las fotos reales de esa persona)
+            radio_pose = float(np.percentile(dists_min_pose[:, -1], 95) * 1.12)
 
-            umbral_mse_clase = float(max(0.0052, np.percentile(mse_ent[y_ent == c], 98) * 1.55))
+            # Umbral MSE real de la clase (sin el piso falso de 0.0052 que dejaba pasar a desconocidos con 0.00363)
+            umbral_mse_clase = float(np.clip(np.percentile(mse_real_c, 96) * 1.28, 0.0024, 0.0031))
 
             perfiles_identidad[int(c)] = {
                 "centroide": mu_c,
@@ -603,16 +618,12 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_real
                 "umbral_mse_clase": umbral_mse_clase,
             }
             nom_c = nombres_clases.get(int(c), f"ID {c}") if nombres_clases else f"ID {c}"
-            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} ({len(matriz_Z_poses)} prototipos reales), MSE clase={umbral_mse_clase:.5f}, Dist media={dist_media:.3f}")
+            print(f"  [BIOMETRIA] Perfil {nom_c}: Dim={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} ({len(matriz_Z_poses)} prototipos), MSE max={umbral_mse_clase:.5f}")
         datos_adicionales["perfiles_identidad"] = perfiles_identidad
 
-        # Umbral de reconstrucción MSE para identidades autorizadas (excluyendo id_desconocido)
         id_desc = max(perfiles_identidad.keys())
-        mask_autorizados = (y_ent != id_desc)
-        if np.any(mask_autorizados):
-            umbral_mse_identidad = float(max(0.0055, np.percentile(mse_ent[mask_autorizados], 98) * 1.60))
-        else:
-            umbral_mse_identidad = float(max(0.0055, np.percentile(mse_ent, 98) * 1.60))
+        umbrales_aut = [perfiles_identidad[k]["umbral_mse_clase"] for k in perfiles_identidad if k != id_desc]
+        umbral_mse_identidad = float(np.max(umbrales_aut)) if umbrales_aut else 0.0030
         datos_adicionales["umbral_mse_identidad"] = umbral_mse_identidad
         print(f"  [BIOMETRIA] Umbral MSE Identidad Calibrado Dinámicamente: {umbral_mse_identidad:.5f}")
 

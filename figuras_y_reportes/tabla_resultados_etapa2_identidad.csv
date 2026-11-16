@@ -1,7 +1,7 @@
 Modelo,Exactitud ent. (%),Error ent. (%),Exactitud val. CV (%),Exactitud prueba (%),Error prueba (%),Brecha (p. p.),Indice_J,Epocas_Ejecutadas,Mejores_Parametros
-SVM,99.92,0.08,97.42,97.97,2.03,1.95,97.97,[2479],"{'C': 5.0, 'gamma': 'scale', 'kernel': 'rbf'}"
-Random Forest,100.0,0.0,96.48,97.03,2.97,2.97,97.03,N/A,"{'max_depth': 12, 'min_samples_leaf': 2, 'n_estimators': 250}"
-k-NN,97.77,2.23,95.04,96.72,3.28,1.05,96.72,N/A,"{'n_neighbors': 5, 'weights': 'uniform'}"
-ANN (MLP),99.45,0.55,95.78,97.5,2.5,1.95,95.5,35,"{'alpha': 0.2, 'hidden_layer_sizes': (128, 64), 'learning_rate_init': 0.001}"
-CNN (Conv2D),99.61,0.39,96.75,95.78,4.22,3.83,95.37,34,"{'hidden_layers': (256, 128), 'alpha': 0.08, 'paciencia': 25}"
-Árbol de decisión,90.74,9.26,85.66,86.41,13.59,4.34,85.74,N/A,"{'criterion': 'entropy', 'max_depth': 6, 'min_samples_leaf': 8}"
+SVM,99.92,0.08,97.85,98.12,1.88,1.8,98.12,[2231],"{'C': 5.0, 'gamma': 'scale', 'kernel': 'rbf'}"
+k-NN,98.09,1.91,95.43,97.97,2.03,0.12,97.97,N/A,"{'n_neighbors': 5, 'weights': 'uniform'}"
+Random Forest,99.65,0.35,96.88,97.5,2.5,2.15,97.5,N/A,"{'max_depth': 12, 'min_samples_leaf': 4, 'n_estimators': 250}"
+CNN (Conv2D),99.69,0.31,97.4,96.72,3.28,2.97,96.72,44,"{'hidden_layers': (256, 128), 'alpha': 0.08, 'paciencia': 25}"
+ANN (MLP),99.38,0.62,96.45,96.72,3.28,2.66,94.72,30,"{'alpha': 0.1, 'hidden_layer_sizes': (128, 64), 'learning_rate_init': 0.001}"
+Árbol de decisión,91.29,8.71,86.76,87.66,12.34,3.63,87.34,N/A,"{'criterion': 'gini', 'max_depth': 6, 'min_samples_leaf': 4}"
