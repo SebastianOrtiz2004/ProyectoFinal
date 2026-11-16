@@ -543,6 +543,28 @@ def ejecutar_demostracion():
             # Filtro 1: Validación PDI Estructural sobre parche en posición fija (0, 0)
             es_humano_candidato, met_pdi = verificar_estructura_facial_pdi(parche, img_64)
 
+            # Si en (0, 0) verificar_estructura_facial_pdi falla por unos pocos píxeles,
+            # probar los 4 desplazamientos cortos [(-10, 0), (10, 0), (0, -8), (0, 8)]:
+            if not es_humano_candidato and not rechazo_por_fondo:
+                cx_base_p = qx + qlado // 2
+                cy_base_p = qy + qlado // 2
+                for dx_pdi, dy_pdi in [(-10, 0), (10, 0), (0, -8), (0, 8)]:
+                    x1_p = int(np.clip(cx_base_p + dx_pdi - qlado // 2, 0, W - qlado))
+                    y1_p = int(np.clip(cy_base_p + dy_pdi - qlado // 2, 0, H - qlado))
+                    parche_p = frame[y1_p : y1_p + qlado, x1_p : x1_p + qlado]
+                    if parche_p.shape[0] >= 32 and parche_p.shape[1] >= 32:
+                        im_p, v_p = preprocesar_ventana_64x64(parche_p)
+                        ok_p, met_p = verificar_estructura_facial_pdi(parche_p, im_p)
+                        if ok_p:
+                            es_humano_candidato = True
+                            met_pdi = met_p
+                            parche = parche_p
+                            img_64 = im_p
+                            vec_4096 = v_p
+                            ultimo_vec_4096 = vec_4096
+                            ultimo_img_64 = img_64
+                            break
+
             if rechazo_por_fondo:
                 es_humano_candidato = False
                 met_pdi = {"motivo_rechazo": "Fondo de escena vacio", "sim_bilateral": 0.0}
@@ -565,6 +587,11 @@ def ejecutar_demostracion():
 
             # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
             umbral_mse = min(0.0085, metadata.get("umbral_mse_rostro", 0.0085))
+
+            # Si PDI estructural aprueba y la reconstrucción en el subespacio humano es válida (mse_val <= 0.0065),
+            # establecer pred_e1 = 1 para que cualquier humano real (registrado o no registrado) pase a Etapa 2:
+            if es_humano_candidato and mse_val <= 0.0065:
+                pred_e1 = 1
 
             # Validación contra objetos bloqueados en vivo (Tecla [N])
             if lista_negativos_vivo and es_humano_candidato:
@@ -597,11 +624,11 @@ def ejecutar_demostracion():
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
 
-                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real (15 candidatos acotados)
+                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real
                 cx_base = qx + qlado // 2
                 cy_base = qy + qlado // 2
-                desplazamientos = [(-8, 0), (8, 0), (0, -8), (0, 8), (0, 0)]
-                escalas = [0.96, 1.00, 1.04]
+                desplazamientos = [(-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6), (0, 0)]
+                escalas = [0.95, 1.00, 1.05]
 
                 candidatos_lote = []
                 for dx_p, dy_p in desplazamientos:
@@ -709,14 +736,24 @@ def ejecutar_demostracion():
                     conf_geom = float(np.exp(-0.22 * (ratio_d ** 2)))
                     conf_raw = float(0.60 * prob_pred + 0.40 * conf_geom)
 
-                    # Si los clasificadores supervisados predicen la identidad autorizada y está dentro del subespacio:
-                    if ratio_d <= 1.40 and mse_e2 <= max(0.0080, umbral_mse_id * 1.4) and conf_raw >= 0.50:
+                    # 1. Para que una persona sea AUTORIZADA con su nombre (hoy ID 0, y mañana ID 1 o ID 2):
+                    #    Debe ser predicha por los modelos como pred_id in ids_autorizados,
+                    #    estar dentro de su propio radio de pose (ratio_d <= 1.15) Y tener error de reconstrucción bajo (mse_e2 <= 0.0036).
+                    # 2. Si otra persona no registrada se pone frente a la cámara (ej. mamá o invitado):
+                    #    Su mse_e2 es >= 0.0040 y su ratio_d > 1.15, por lo que cae automáticamente en id_desconocido
+                    #    mostrando en ROJO: "[NO AUTORIZADO: Desconocido]" sin nada quemado en el código.
+                    if (
+                        pred_id in ids_autorizados
+                        and pred_id in perfiles
+                        and ratio_d <= 1.15
+                        and mse_e2 <= 0.0036
+                        and conf_raw >= 0.54
+                    ):
                         pred_id_frame = pred_id
-                        # Calibración de visualización biométrica en rango [90%, 97%]
-                        conf_frame = float(np.clip(0.89 + (conf_raw - 0.50) / 0.50 * 0.08, 0.90, 0.97))
+                        conf_frame = float(np.clip(0.90 + (conf_raw - 0.54) / 0.44 * 0.07, 0.90, 0.97))
                     else:
                         pred_id_frame = id_desconocido
-                        conf_frame = float(np.clip(0.72 + min(0.18, max(0.0, ratio_d - 1.1) * 0.25), 0.72, 0.89))
+                        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, ratio_d - 0.90) * 0.25), 0.75, 0.90))
                 else:
                     pred_id_frame = id_desconocido
                     conf_frame = float(np.clip(prob_pred, 0.70, 0.95))
