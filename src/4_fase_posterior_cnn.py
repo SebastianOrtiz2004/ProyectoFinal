@@ -60,26 +60,51 @@ def entrenar_evaluar_cnn():
     F_conv_pru = extraer_mapas_convolucionales_2d(X_pru)
     print(f"Dimensión del mapa de características convolucional: {F_conv_ent.shape[1]}")
 
-    print("Estandarizando características convolucionales con StandardScaler...")
+    print("Cargando proyección espectral PCA y fusionando con mapas convolucionales 2D...")
+    from utils_pdi import ScalerPreservandoVarianza
+    ruta_pca_e2 = os.path.join(DIR_MODELOS, "etapa2_pca_identidad.pkl")
+    if os.path.exists(ruta_pca_e2):
+        datos_pca = joblib.load(ruta_pca_e2)
+        if isinstance(datos_pca, dict):
+            pca_e2 = datos_pca["pca"]
+            scaler_pca = datos_pca.get("scaler", ScalerPreservandoVarianza(n_pca=pca_e2.n_components_))
+        else:
+            pca_e2 = datos_pca
+            scaler_pca = ScalerPreservandoVarianza(n_pca=pca_e2.n_components_)
+    else:
+        from sklearn.decomposition import PCA
+        pca_e2 = PCA(n_components=0.95, whiten=False, random_state=42).fit(X_ent.reshape(-1, 4096))
+        scaler_pca = ScalerPreservandoVarianza(n_pca=pca_e2.n_components_)
+
+    F_ent, _ = modulo_ent.extraer_caracteristicas_pca_mse(pca_e2, X_ent.reshape(-1, 4096))
+    F_pru, _ = modulo_ent.extraer_caracteristicas_pca_mse(pca_e2, X_pru.reshape(-1, 4096))
+    F_ent_scaled = scaler_pca.fit_transform(F_ent) if hasattr(scaler_pca, "fit_transform") else scaler_pca.transform(F_ent)
+    F_pru_scaled = scaler_pca.transform(F_pru) if hasattr(scaler_pca, "transform") else F_pru
+
+    print("Estandarizando características convolucionales con StandardScaler (factor 0.35)...")
     scaler_cnn = StandardScaler()
-    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent)
-    F_conv_pru_s = scaler_cnn.transform(F_conv_pru)
+    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent) * 0.35
+    F_conv_pru_s = scaler_cnn.transform(F_conv_pru) * 0.35
+
+    F_cnn_total_ent = np.hstack([F_ent_scaled, F_conv_ent_s])
+    F_cnn_total_pru = np.hstack([F_pru_scaled, F_conv_pru_s])
+    print(f"Dimensión del vector fusionado [PCA + Conv2D]: {F_cnn_total_ent.shape[1]}")
 
     print("Entrenando clasificador denso profundo (256, 128) con regularización L2 y Early Stopping...")
     # Capa Densa Final (Softmax / Cross-Entropy)
     clf_cnn = MLPClassifier(
         hidden_layer_sizes=(256, 128),
         activation="relu",
-        alpha=0.1,  # Regularización anti-overfitting
+        alpha=0.08,  # Regularización anti-overfitting
         max_iter=500,
         early_stopping=True,
         random_state=42,
     )
-    clf_cnn.fit(F_conv_ent_s, y_ent)
+    clf_cnn.fit(F_cnn_total_ent, y_ent)
     print(f"  [ÉPOCAS CNN] Clasificador denso convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas.")
 
-    y_pred_ent = clf_cnn.predict(F_conv_ent_s)
-    y_pred_pru = clf_cnn.predict(F_conv_pru_s)
+    y_pred_ent = clf_cnn.predict(F_cnn_total_ent)
+    y_pred_pru = clf_cnn.predict(F_cnn_total_pru)
 
     acc_ent = accuracy_score(y_ent, y_pred_ent) * 100.0
     err_ent = 100.0 - acc_ent
@@ -93,7 +118,16 @@ def entrenar_evaluar_cnn():
 
     # Serializar el modelo CNN entrenado para su uso en tiempo real en 3_reconocimiento_en_vivo.py
     ruta_modelo_cnn = os.path.join(DIR_MODELOS, "etapa2_cnn_profunda.pkl")
-    joblib.dump({"modelo": clf_cnn, "scaler": scaler_cnn}, ruta_modelo_cnn)
+    joblib.dump(
+        {
+            "modelo": clf_cnn,
+            "scaler": scaler_pca,
+            "scaler_cnn": scaler_cnn,
+            "es_cnn_2d": True,
+            "params": {"hidden_layers": (256, 128), "alpha": 0.08},
+        },
+        ruta_modelo_cnn,
+    )
     print(f"[OK] Modelo CNN serializado exitosamente en: {ruta_modelo_cnn}")
 
     # Cargar tabla previa de la Etapa 2 si existe para comparación directa

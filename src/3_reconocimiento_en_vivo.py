@@ -544,11 +544,11 @@ def ejecutar_demostracion():
             es_humano_candidato, met_pdi = verificar_estructura_facial_pdi(parche, img_64)
 
             # Si en (0, 0) verificar_estructura_facial_pdi falla por unos pocos píxeles,
-            # probar los 4 desplazamientos cortos [(-10, 0), (10, 0), (0, -8), (0, 8)]:
+            # probar micro-desplazamientos de búsqueda rápida antes de descartar:
             if not es_humano_candidato and not rechazo_por_fondo:
                 cx_base_p = qx + qlado // 2
                 cy_base_p = qy + qlado // 2
-                for dx_pdi, dy_pdi in [(-10, 0), (10, 0), (0, -8), (0, 8)]:
+                for dx_pdi, dy_pdi in [(-18, 0), (18, 0), (0, -14), (0, 14), (-12, -12), (12, 12)]:
                     x1_p = int(np.clip(cx_base_p + dx_pdi - qlado // 2, 0, W - qlado))
                     y1_p = int(np.clip(cy_base_p + dy_pdi - qlado // 2, 0, H - qlado))
                     parche_p = frame[y1_p : y1_p + qlado, x1_p : x1_p + qlado]
@@ -588,9 +588,9 @@ def ejecutar_demostracion():
             # Conexión obligatoria de filtros en Etapa 1: PDI estructural + Subespacio PCA
             umbral_mse = min(0.0085, metadata.get("umbral_mse_rostro", 0.0085))
 
-            # Si PDI estructural aprueba y la reconstrucción en el subespacio humano es válida (mse_val <= 0.0065),
-            # establecer pred_e1 = 1 para que cualquier humano real (registrado o no registrado) pase a Etapa 2:
-            if es_humano_candidato and mse_val <= 0.0065:
+            # Con X_olivetti ya incluido en el entrenamiento de la Etapa 1, evaluar el modelo supervisado.
+            # Rescate por subespacio solo si la simetría facial PDI y el MSE son genuinamente humanos:
+            if es_humano_candidato and mse_val <= 0.0048 and met_pdi.get("sim_bilateral", 0.0) >= 0.80:
                 pred_e1 = 1
 
             # Validación contra objetos bloqueados en vivo (Tecla [N])
@@ -624,11 +624,16 @@ def ejecutar_demostracion():
                 telemetria["es_humano"] = True
                 telemetria["estado_e1"] = "HUMANO DETECTADO (Aprobado)"
 
-                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real
+                # Pirámide Multi-Escala y Multi-Posición Vectorizada en Tiempo Real (Rejilla Amplia de 45 Candidatos)
                 cx_base = qx + qlado // 2
                 cy_base = qy + qlado // 2
-                desplazamientos = [(-10, 0), (10, 0), (0, -10), (0, 10), (-6, -6), (6, 6), (0, 0)]
-                escalas = [0.95, 1.00, 1.05]
+                desplazamientos = [
+                    (0, 0), (-12, 0), (12, 0), (0, -12), (0, 12),
+                    (-24, 0), (24, 0), (0, -22), (0, 22),
+                    (-14, -14), (14, -14), (-14, 14), (14, 14),
+                    (-22, -14), (22, -14), (-22, 14), (22, 14),
+                ]
+                escalas = [0.88, 0.94, 1.00, 1.06, 1.12]
 
                 candidatos_lote = []
                 for dx_p, dy_p in desplazamientos:
@@ -726,37 +731,32 @@ def ejecutar_demostracion():
                 if pred_id in ids_autorizados and pred_id in perfiles:
                     perfil_cand = perfiles[pred_id]
                     mat_poses_cand = perfil_cand.get("matriz_Z_poses", None)
-                    radio_pose_cand = perfil_cand.get("radio_pose", 14.0)
+                    radio_pose_cand = perfil_cand.get("radio_pose", 14.5)
+                    umbral_mse_cand = perfil_cand.get("umbral_mse_clase", max(0.0052, umbral_mse_id))
+
                     if mat_poses_cand is not None and len(mat_poses_cand) > 0:
                         dist_geo = float(np.min(np.linalg.norm(mat_poses_cand - z_e2_raw, axis=1)))
                     else:
                         dist_geo = float(np.linalg.norm(z_e2_raw - perfil_cand["centroide"]))
                     ratio_d = dist_geo / (radio_pose_cand + 1e-6)
 
-                    conf_geom = float(np.exp(-0.22 * (ratio_d ** 2)))
-                    conf_raw = float(0.60 * prob_pred + 0.40 * conf_geom)
+                    conf_geom = float(np.exp(-0.20 * (ratio_d ** 2)))
+                    conf_raw = float(0.62 * prob_pred + 0.38 * conf_geom)
 
-                    # 1. Para que una persona sea AUTORIZADA con su nombre (hoy ID 0, y mañana ID 1 o ID 2):
-                    #    Debe ser predicha por los modelos como pred_id in ids_autorizados,
-                    #    estar dentro de su propio radio de pose (ratio_d <= 1.15) Y tener error de reconstrucción bajo (mse_e2 <= 0.0036).
-                    # 2. Si otra persona no registrada se pone frente a la cámara (ej. mamá o invitado):
-                    #    Su mse_e2 es >= 0.0040 y su ratio_d > 1.15, por lo que cae automáticamente en id_desconocido
-                    #    mostrando en ROJO: "[NO AUTORIZADO: Desconocido]" sin nada quemado en el código.
+                    # Verificación biométrica dinámica para la identidad pred_id (hoy ID 0, mañana ID 0, 1, 2...):
                     if (
-                        pred_id in ids_autorizados
-                        and pred_id in perfiles
-                        and ratio_d <= 1.15
-                        and mse_e2 <= 0.0036
-                        and conf_raw >= 0.54
+                        ratio_d <= 1.32
+                        and mse_e2 <= umbral_mse_cand
+                        and conf_raw >= 0.52
                     ):
                         pred_id_frame = pred_id
-                        conf_frame = float(np.clip(0.90 + (conf_raw - 0.54) / 0.44 * 0.07, 0.90, 0.97))
+                        conf_frame = float(np.clip(0.90 + (conf_raw - 0.52) / 0.45 * 0.07, 0.90, 0.97))
                     else:
                         pred_id_frame = id_desconocido
-                        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, ratio_d - 0.90) * 0.25), 0.75, 0.90))
+                        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, ratio_d - 1.0) * 0.25), 0.75, 0.90))
                 else:
                     pred_id_frame = id_desconocido
-                    conf_frame = float(np.clip(prob_pred, 0.70, 0.95))
+                    conf_frame = float(np.clip(prob_pred, 0.72, 0.92))
 
                 # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 8)
                 buffer_verificacion.append((pred_id_frame, conf_frame))

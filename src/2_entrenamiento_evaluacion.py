@@ -173,58 +173,71 @@ def cargar_dataset_completo():
 def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None):
     """
     Etapa 1 (Binaria):
-        Clase 0: No Persona (1,280 muestras: todos los objetos reales + fliplr + completado con fondos)
-        Clase 1: Es Persona (1,280 muestras: 100% fotos reales de Sebastián + 350 aumentación + Olivetti)
-    Balanceo estricto 50% / 50% (1,280 vs 1,280).
+        Clase 0: No Persona (1,600 muestras: todos los objetos reales + fliplr + completado con fondos)
+        Clase 1: Es Persona (1,600 muestras: 600 rostros de Olivetti con escala + 1,000 de personas registradas)
+    Balanceo estricto 50% / 50% (1,600 vs 1,600).
     """
-    rostros_list = []
-    variaciones = [
-        (-8, 0, 1.0, False), (8, 0, 1.0, False),
-        (0, -8, 1.0, False), (0, 8, 1.0, False),
-        (-6, -6, 1.0, False), (6, 6, 1.0, False),
-        (-5, 0, 0.95, False), (5, 0, 1.05, False),
-        (0, -5, 0.95, False), (0, 5, 1.05, False),
-        (0, 0, 0.90, False), (0, 0, 0.95, False),
-        (0, 0, 1.05, False), (0, 0, 1.10, False),
-        (0, 0, 1.0, True), (5, 0, 1.0, True), (-5, 0, 1.0, True),
-        (0, -5, 1.0, True), (0, 5, 1.0, True),
-        (-6, -6, 1.05, True), (6, 6, 0.95, True),
-        (-4, 0, 0.90, True), (4, 0, 1.10, True),
+    np.random.seed(42)
+
+    # 1. Rostros humanos diversos (Olivetti 400 originales + 200 a escala de webcam = 600)
+    oli_list = [X_olivetti]
+    idx_oli_200 = np.random.choice(len(X_olivetti), size=200, replace=False)
+    oli_aug = []
+    for i, idx_o in enumerate(idx_oli_200):
+        img_o = X_olivetti[idx_o].reshape(64, 64)
+        sc = 0.82 if i % 2 == 0 else 0.88
+        dx = (-4 if i % 4 == 0 else 4) if i % 2 == 0 else 0
+        dy = (-3 if i % 3 == 0 else 3)
+        fl = (i % 2 == 0)
+        im_w = aumentar_geometria_rostro(img_o, dx=dx, dy=dy, scale=sc, flip=fl)
+        oli_aug.append(im_w.reshape(-1))
+    oli_list.append(np.array(oli_aug, dtype=np.float64))
+    X_humanos_diversos = np.vstack(oli_list)  # Exactamente 600 muestras
+
+    # 2. Identidades registradas (1,000 muestras distribuidas entre las identidades)
+    variaciones_e1 = [
+        (-10, 0, 1.0, False), (10, 0, 1.0, False),
+        (0, -10, 1.0, False), (0, 10, 1.0, False),
+        (-6, -6, 0.94, False), (6, 6, 1.06, False),
+        (-6, 0, 0.88, False), (6, 0, 1.12, False),
+        (0, -6, 0.88, False), (0, 6, 1.12, False),
+        (0, 0, 0.88, True), (0, 0, 1.12, True),
+        (-6, 0, 1.0, True), (6, 0, 1.0, True),
     ]
 
+    cuota_por_id = 1000 // max(1, len(dict_identidades))
+    registrados_list = []
     for k in dict_identidades:
-        data_k = dict_identidades[k]["data"]  # 100% de fotos reales de cada identidad
-        rostros_list.append(data_k)
+        data_k = dict_identidades[k]["data"]
+        n_reales = min(len(data_k), int(cuota_por_id * 0.70))
+        idx_reales = np.linspace(0, len(data_k) - 1, n_reales, dtype=int)
+        registrados_list.append(data_k[idx_reales])
 
-        # 350 muestras con aumentación geométrica multi-escala y traslación
-        np.random.seed(42 + k)
-        idx_aug = np.random.choice(len(data_k), size=350, replace=(len(data_k) < 350))
-        muestras_aug = []
-        for i, idx_a in enumerate(idx_aug):
-            img_m = data_k[idx_a].reshape(64, 64)
-            dx, dy, sc, fl = variaciones[i % len(variaciones)]
-            im_warp = aumentar_geometria_rostro(img_m, dx=dx, dy=dy, scale=sc, flip=fl)
-            muestras_aug.append(im_warp.reshape(-1))
-        rostros_list.append(np.array(muestras_aug))
+        n_aug = cuota_por_id - n_reales
+        if n_aug > 0:
+            idx_aug = np.random.choice(len(data_k), size=n_aug, replace=(n_aug > len(data_k)))
+            aug_k = []
+            for i, idx_a in enumerate(idx_aug):
+                img_m = data_k[idx_a].reshape(64, 64)
+                dx, dy, sc, fl = variaciones_e1[i % len(variaciones_e1)]
+                im_w = aumentar_geometria_rostro(img_m, dx=dx, dy=dy, scale=sc, flip=fl)
+                aug_k.append(im_w.reshape(-1))
+            registrados_list.append(np.array(aug_k, dtype=np.float64))
 
-    rostros_humanos_totales = np.vstack(rostros_list)
-    if len(rostros_humanos_totales) < 1280:
-        faltan_h = 1280 - len(rostros_humanos_totales)
-        np.random.seed(42)
-        idx_oli = np.random.choice(len(X_olivetti), size=min(faltan_h, len(X_olivetti)), replace=False)
-        rostros_humanos_totales = np.vstack([rostros_humanos_totales, X_olivetti[idx_oli]])
+    X_registrados = np.vstack(registrados_list)
+    if len(X_registrados) > 1000:
+        idx_r = np.random.choice(len(X_registrados), size=1000, replace=False)
+        X_registrados = X_registrados[idx_r]
+    elif len(X_registrados) < 1000:
+        faltan_r = 1000 - len(X_registrados)
+        idx_dup = np.random.choice(len(X_registrados), size=faltan_r, replace=True)
+        X_registrados = np.vstack([X_registrados, X_registrados[idx_dup]])
 
-    if len(rostros_humanos_totales) > 1280:
-        np.random.seed(42)
-        idx_h_sel = np.random.choice(len(rostros_humanos_totales), size=1280, replace=False)
-        X_humanos = rostros_humanos_totales[idx_h_sel]
-    else:
-        X_humanos = rostros_humanos_totales
-
+    X_humanos = np.vstack([X_humanos_diversos, X_registrados])  # 600 + 1000 = 1600
     y_humanos = np.ones(len(X_humanos), dtype=int)
-    num_humanos = 1280
+    num_humanos = 1600
 
-    # Clase 0: No Persona (1,280 muestras con todos los objetos + fondos)
+    # Clase 0: No Persona (1,600 muestras combinando objetos reales + fliplr + fondos)
     no_humano_list = []
     if X_obj is not None and len(X_obj) > 0:
         no_humano_list.append(X_obj)
@@ -233,12 +246,10 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 
     X_objs_aug = np.vstack(no_humano_list) if no_humano_list else np.empty((0, 4096))
     if len(X_objs_aug) >= num_humanos:
-        np.random.seed(42)
         idx_sel = np.random.choice(len(X_objs_aug), size=num_humanos, replace=False)
         X_no_humano = X_objs_aug[idx_sel]
     else:
         faltantes = num_humanos - len(X_objs_aug)
-        np.random.seed(42)
         idx_f = np.random.choice(len(X_fondo), size=min(faltantes, len(X_fondo)), replace=(faltantes > len(X_fondo)))
         X_no_humano = np.vstack([X_objs_aug, X_fondo[idx_f]]) if len(X_objs_aug) > 0 else X_fondo[idx_f]
 
@@ -249,7 +260,7 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 
     X_etapa1 = np.vstack([X_no_humano, X_humanos])
     y_etapa1 = np.concatenate([y_no_humano, y_humanos])
-    print(f"  [BALANCE ETAPA 1] Clase 0 (No Persona): {len(y_no_humano)} | Clase 1 (Persona): {len(y_humanos)} (Balance 50/50 estricto: 1280 vs 1280).")
+    print(f"  [BALANCE ETAPA 1] Clase 0 (No Persona): {len(y_no_humano)} | Clase 1 (Persona): {len(y_humanos)} (Balance 50/50 estricto: 1,600 vs 1,600).")
 
     return X_etapa1, y_etapa1
 
@@ -257,46 +268,55 @@ def construir_matrices_etapa1(X_olivetti, X_fondo, dict_identidades, X_obj=None)
 def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=None):
     """
     Etapa 2 (Multiclase de Identidad):
-        Para cada ID registrado: 100% fotos reales (~933) + 350 aumentación geométrica = 1,280 muestras.
-        Clase Desconocido / Otros: Olivetti + Objetos reales + fliplr + Fondos = 1,280 muestras.
+        Para cada ID registrado: hasta 1,150 fotos reales + 450 aumentación geométrica = 1,600 muestras.
+        Clase Desconocido / Otros: 800 rostros humanos de desconocidos (Olivetti + escala webcam)
+                                 + 800 muestras negativas de objetos y fondos = 1,600 muestras.
     """
     X_list = []
     y_list = []
     nombres_clases = {}
+    meta_por_clase = 1600
 
-    variaciones = [
-        (-8, 0, 1.0, False), (8, 0, 1.0, False),
-        (0, -8, 1.0, False), (0, 8, 1.0, False),
-        (-6, -6, 1.0, False), (6, 6, 1.0, False),
-        (-5, 0, 0.95, False), (5, 0, 1.05, False),
-        (0, -5, 0.95, False), (0, 5, 1.05, False),
-        (0, 0, 0.90, False), (0, 0, 0.95, False),
-        (0, 0, 1.05, False), (0, 0, 1.10, False),
-        (0, 0, 1.0, True), (5, 0, 1.0, True), (-5, 0, 1.0, True),
-        (0, -5, 1.0, True), (0, 5, 1.0, True),
-        (-6, -6, 1.05, True), (6, 6, 0.95, True),
-        (-4, 0, 0.90, True), (4, 0, 1.10, True),
+    variaciones_e2 = [
+        (-10, 0, 1.0, False), (10, 0, 1.0, False),
+        (0, -10, 1.0, False), (0, 10, 1.0, False),
+        (-6, -6, 0.93, False), (6, 6, 1.07, False),
+        (-6, 0, 0.88, False), (6, 0, 1.12, False),
+        (0, -6, 0.88, False), (0, 6, 1.12, False),
+        (-8, -8, 1.0, True), (8, 8, 1.0, True),
+        (-6, 0, 0.93, True), (6, 0, 1.07, True),
+        (0, -6, 0.88, True), (0, 6, 1.12, True),
+        (0, 0, 0.88, True), (0, 0, 1.12, True),
+        (-10, 0, 0.93, False), (10, 0, 1.07, False),
     ]
 
     for id_num in sorted(dict_identidades.keys()):
         info = dict_identidades[id_num]
-        data = info["data"]  # 100% de fotos reales (sin descarte a 250!)
+        data = info["data"]
 
-        # 350 muestras con aumentación geométrica
+        if len(data) > 1150:
+            idx_reales = np.linspace(0, len(data) - 1, 1150, dtype=int)
+            data_reales = data[idx_reales]
+            n_aug = meta_por_clase - 1150  # 450
+        else:
+            data_reales = data
+            n_aug = meta_por_clase - len(data)
+
+        # Generar muestras aumentadas
         np.random.seed(42 + id_num)
-        idx_aug = np.random.choice(len(data), size=350, replace=(len(data) < 350))
+        idx_aug = np.random.choice(len(data), size=n_aug, replace=(n_aug > len(data)))
         muestras_aug = []
         for i, idx_a in enumerate(idx_aug):
             img_m = data[idx_a].reshape(64, 64)
-            dx, dy, sc, fl = variaciones[i % len(variaciones)]
+            dx, dy, sc, fl = variaciones_e2[i % len(variaciones_e2)]
             im_warp = aumentar_geometria_rostro(img_m, dx=dx, dy=dy, scale=sc, flip=fl)
             muestras_aug.append(im_warp.reshape(-1))
 
-        data_clase = np.vstack([data, np.array(muestras_aug)])
-        if len(data_clase) > 1280:
-            data_clase = data_clase[:1280]
-        elif len(data_clase) < 1280:
-            faltan = 1280 - len(data_clase)
+        data_clase = np.vstack([data_reales, np.array(muestras_aug, dtype=np.float64)])
+        if len(data_clase) > meta_por_clase:
+            data_clase = data_clase[:meta_por_clase]
+        elif len(data_clase) < meta_por_clase:
+            faltan = meta_por_clase - len(data_clase)
             idx_rep = np.random.choice(len(data_clase), size=faltan, replace=True)
             data_clase = np.vstack([data_clase, data_clase[idx_rep]])
 
@@ -304,32 +324,53 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
         y_list.append(np.full(len(data_clase), id_num, dtype=int))
         nombres_clases[id_num] = info["nombre"]
 
-    # Clase 'Desconocido / Otros': 1,280 muestras (Olivetti + Objetos + Fondos)
+    # Clase 'Desconocido / Otros': 1,600 muestras (800 rostros humanos desconocidos + 800 objetos/fondos)
     id_desconocido = max(dict_identidades.keys()) + 1 if dict_identidades else 1
-    desc_componentes = []
+    np.random.seed(42)
 
-    # 1. Olivetti Faces completos
-    desc_componentes.append(X_olivetti)
+    # 1. 800 rostros humanos de desconocidos (400 fotos de Olivetti + 400 aumentadas)
+    oli_desc = [X_olivetti]
+    idx_oli_400 = np.random.choice(len(X_olivetti), size=400, replace=False)
+    variaciones_desc = [
+        (-8, 0, 0.88, False), (8, 0, 0.94, False),
+        (0, -8, 0.82, False), (0, 8, 0.88, False),
+        (-6, 0, 0.82, True), (6, 0, 0.94, True),
+        (0, 0, 0.88, True), (0, 0, 0.82, False),
+    ]
+    oli_desc_aug = []
+    for i, idx_o in enumerate(idx_oli_400):
+        img_o = X_olivetti[idx_o].reshape(64, 64)
+        dx, dy, sc, fl = variaciones_desc[i % len(variaciones_desc)]
+        im_w = aumentar_geometria_rostro(img_o, dx=dx, dy=dy, scale=sc, flip=fl)
+        oli_desc_aug.append(im_w.reshape(-1))
+    oli_desc.append(np.array(oli_desc_aug, dtype=np.float64))
+    X_humanos_desc = np.vstack(oli_desc)  # Exactamente 800 muestras
 
-    # 2. Objetos reales + fliplr
+    # 2. 800 muestras negativas de objetos y fondos (450 de X_obj + 350 de X_fondo)
+    neg_desc_list = []
     if X_obj is not None and len(X_obj) > 0:
-        desc_componentes.append(X_obj)
-        obj_fl = np.array([np.fliplr(im.reshape(64, 64)).reshape(-1) for im in X_obj])
-        desc_componentes.append(obj_fl)
+        n_obj_sel = min(450, len(X_obj))
+        idx_obj = np.random.choice(len(X_obj), size=n_obj_sel, replace=False)
+        neg_desc_list.append(X_obj[idx_obj])
+        faltan_obj = 450 - n_obj_sel
+        if faltan_obj > 0:
+            obj_fl = np.array([np.fliplr(im.reshape(64, 64)).reshape(-1) for im in X_obj[:faltan_obj]])
+            neg_desc_list.append(obj_fl)
 
-    # 3. Fondos de la habitación
     if X_fondo is not None and len(X_fondo) > 0:
-        desc_componentes.append(X_fondo)
+        n_fondo_sel = min(350, len(X_fondo))
+        idx_f = np.random.choice(len(X_fondo), size=n_fondo_sel, replace=(n_fondo_sel > len(X_fondo)))
+        neg_desc_list.append(X_fondo[idx_f])
 
-    desconocidos_total = np.vstack(desc_componentes)
-    if len(desconocidos_total) > 1280:
-        np.random.seed(42)
-        idx_desc_sel = np.random.choice(len(desconocidos_total), size=1280, replace=False)
-        desconocidos_total = desconocidos_total[idx_desc_sel]
-    elif len(desconocidos_total) < 1280:
-        faltan_desc = 1280 - len(desconocidos_total)
-        idx_extra_oli = np.random.choice(len(X_olivetti), size=faltan_desc, replace=True)
-        desconocidos_total = np.vstack([desconocidos_total, X_olivetti[idx_extra_oli]])
+    X_neg_desc = np.vstack(neg_desc_list) if neg_desc_list else np.empty((0, 4096))
+    if len(X_neg_desc) < 800 and X_fondo is not None and len(X_fondo) > 0:
+        faltan_neg = 800 - len(X_neg_desc)
+        idx_extra_f = np.random.choice(len(X_fondo), size=faltan_neg, replace=True)
+        X_neg_desc = np.vstack([X_neg_desc, X_fondo[idx_extra_f]]) if len(X_neg_desc) > 0 else X_fondo[idx_extra_f]
+    elif len(X_neg_desc) > 800:
+        X_neg_desc = X_neg_desc[:800]
+
+    desconocidos_total = np.vstack([X_humanos_desc, X_neg_desc])  # 800 + 800 = 1600
 
     X_list.append(desconocidos_total)
     y_list.append(np.full(len(desconocidos_total), id_desconocido, dtype=int))
@@ -338,7 +379,7 @@ def construir_matrices_etapa2(X_olivetti, dict_identidades, X_obj=None, X_fondo=
     X_etapa2 = np.vstack(X_list)
     y_etapa2 = np.concatenate(y_list)
     resumen_clases = " | ".join(f"{nombres_clases[c]}: {np.sum(y_etapa2 == c)}" for c in sorted(nombres_clases.keys()))
-    print(f"  [BALANCE ETAPA 2 MULTICLASE] {resumen_clases} (1,280 muestras por clase).")
+    print(f"  [BALANCE ETAPA 2 MULTICLASE] {resumen_clases} ({meta_por_clase} muestras por clase).")
 
     return X_etapa2, y_etapa2, nombres_clases
 
@@ -537,14 +578,16 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_real
             radio_c = float(np.percentile(dists_c, 98) * 1.40)
             dist_media = float(np.mean(dists_c))
 
-            # Matriz de referencia matriz_Z_poses con 250 prototipos representativos multi-pose sobre fotos reales
-            idx_p = np.linspace(0, len(Z_c_poses) - 1, min(250, len(Z_c_poses)), dtype=int)
+            # Matriz de referencia matriz_Z_poses con hasta 300 prototipos representativos multi-pose sobre fotos reales
+            idx_p = np.linspace(0, len(Z_c_poses) - 1, min(300, len(Z_c_poses)), dtype=int)
             matriz_Z_poses = Z_c_poses[idx_p]
 
             from sklearn.neighbors import NearestNeighbors
             nn_poses = NearestNeighbors(n_neighbors=min(12, len(matriz_Z_poses)), metric="euclidean").fit(matriz_Z_poses)
             dists_min_pose, _ = nn_poses.kneighbors(Z_c_poses)
-            radio_pose = float(np.percentile(dists_min_pose[:, -1], 96) * 1.45)
+            radio_pose = float(np.percentile(dists_min_pose[:, -1], 97) * 1.45)
+
+            umbral_mse_clase = float(max(0.0052, np.percentile(mse_ent[y_ent == c], 98) * 1.55))
 
             perfiles_identidad[int(c)] = {
                 "centroide": mu_c,
@@ -552,9 +595,10 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_real
                 "matriz_Z_poses": matriz_Z_poses,
                 "radio_pose": radio_pose,
                 "dist_media": dist_media,
+                "umbral_mse_clase": umbral_mse_clase,
             }
             nom_c = nombres_clases.get(int(c), f"ID {c}") if nombres_clases else f"ID {c}"
-            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} (250 prototipos reales), Dist media={dist_media:.3f}")
+            print(f"  [BIOMETRIA] Perfil {nom_c}: Centroide K={len(mu_c)}, Radio max={radio_c:.3f}, Radio pose={radio_pose:.3f} ({len(matriz_Z_poses)} prototipos reales), MSE clase={umbral_mse_clase:.5f}, Dist media={dist_media:.3f}")
         datos_adicionales["perfiles_identidad"] = perfiles_identidad
 
         # Umbral de reconstrucción MSE para identidades autorizadas (excluyendo id_desconocido)
