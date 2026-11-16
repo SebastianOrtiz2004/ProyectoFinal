@@ -616,6 +616,72 @@ def extraer_descriptor_espacial_bloques(im_64: np.ndarray) -> np.ndarray:
     return np.array(feats, dtype=np.float64)
 
 
+def extraer_puntos_faciales_landmarks_pdi(im_64: np.ndarray):
+    """
+    Extrae los 5 puntos anatómicos clave del rostro (Landmarks: Ojo Izq, Ojo Der,
+    Ápice Nasal, Comisura Labial Izq y Der) mediante momentos espaciales (m10/m00, m01/m00)
+    sobre el mapa de energía morfológica, y calcula 12 descriptores geométricos
+    invariantes a traslación y escala (añadidos al vector de Machine Learning).
+    """
+    gy = np.abs(cv2.Sobel(im_64, cv2.CV_64F, 0, 1, ksize=3))
+    gx = np.abs(cv2.Sobel(im_64, cv2.CV_64F, 1, 0, ksize=3))
+    med = float(np.median(im_64))
+    # Mapa de energía de rasgos faciales (cuencas oculares, fosas nasales y comisura labial)
+    energia = gy + 0.35 * gx + np.maximum(0.0, med - im_64) * 0.85
+
+    def _centroide_ventana(r0, r1, c0, c1):
+        sub = energia[r0:r1, c0:c1] ** 2
+        m00 = float(np.sum(sub)) + 1e-8
+        yy, xx = np.mgrid[r0:r1, c0:c1]
+        cx = float(np.sum(xx * sub) / m00)
+        cy = float(np.sum(yy * sub) / m00)
+        return cx, cy
+
+    # 5 Puntos Faciales (Landmarks en coordenadas 64x64)
+    x_oi, y_oi = _centroide_ventana(14, 35, 12, 31)   # 1. Ojo izquierdo
+    x_od, y_od = _centroide_ventana(14, 35, 33, 52)   # 2. Ojo derecho
+    x_na, y_na = _centroide_ventana(25, 41, 24, 40)   # 3. Nariz (ápice/puente)
+    x_bi, y_bi = _centroide_ventana(38, 54, 16, 32)   # 4. Comisura labial izquierda
+    x_bd, y_bd = _centroide_ventana(38, 54, 32, 48)   # 5. Comisura labial derecha
+
+    x_boca = 0.5 * (x_bi + x_bd)
+    y_boca = 0.5 * (y_bi + y_bd)
+    y_ojos = 0.5 * (y_oi + y_od)
+    x_ojos = 0.5 * (x_oi + x_od)
+
+    # Distancias euclidianas normalizadas
+    d_ojos = float(np.hypot(x_od - x_oi, y_od - y_oi)) / 64.0
+    d_boca = float(np.hypot(x_bd - x_bi, y_bd - y_bi)) / 64.0
+    d_ojos_nariz = float(y_na - y_ojos) / 64.0
+    d_ojos_boca = float(y_boca - y_ojos) / 64.0
+    d_nariz_boca = float(y_boca - y_na) / 64.0
+
+    # Proporciones antropométricas invariantes a zoom/escala y posición
+    ratio_ojos_boca = float(d_ojos / (abs(d_ojos_boca) + 1e-4))
+    ratio_nariz_boca = float(d_ojos_nariz / (abs(d_ojos_boca) + 1e-4))
+    ratio_ancho_boca_ojos = float(d_boca / (d_ojos + 1e-4))
+    inclinacion_ojos = float((y_od - y_oi) / (d_ojos * 64.0 + 1e-4))
+    simetria_yaw = float(((x_na - x_oi) - (x_od - x_na)) / (d_ojos * 64.0 + 1e-4))
+    alineacion_vertical = float((x_boca - x_na) / 64.0)
+    energia_triangulo = float(np.mean(energia) / (np.std(im_64) + 1e-4))
+
+    features_12 = np.array([
+        d_ojos, d_boca, d_ojos_nariz, d_ojos_boca, d_nariz_boca,
+        ratio_ojos_boca, ratio_nariz_boca, ratio_ancho_boca_ojos,
+        inclinacion_ojos, simetria_yaw, alineacion_vertical, energia_triangulo
+    ], dtype=np.float64)
+
+    puntos_dict = {
+        "ojo_izq": (x_oi, y_oi),
+        "ojo_der": (x_od, y_od),
+        "nariz": (x_na, y_na),
+        "boca_izq": (x_bi, y_bi),
+        "boca_der": (x_bd, y_bd),
+        "boca_centro": (x_boca, y_boca),
+    }
+    return features_12, puntos_dict
+
+
 def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
     """
     Bloque Convolucional 2D Auténtico de Cátedra (Para Fase Posterior CNN e Inferencia en Vivo):
@@ -675,7 +741,7 @@ def extraer_mapas_convolucionales_2d(imagenes_64x64: np.ndarray) -> np.ndarray:
 def aumentar_geometria_rostro(im_64: np.ndarray, dx=0, dy=0, scale=1.0, flip=False) -> np.ndarray:
     """
     Aplica traslación (dx, dy), escala (zoom) y/o espejado horizontal sobre una imagen de 64x64
-    rellenando los bordes vacíos con el tono neutro de cátedra (0.42).
+    usando BORDER_REFLECT_101 y reaplicando la máscara elíptica para evitar bordes artificiales.
     """
     im = im_64.copy()
     if flip:
@@ -684,8 +750,8 @@ def aumentar_geometria_rostro(im_64: np.ndarray, dx=0, dy=0, scale=1.0, flip=Fal
     M = cv2.getRotationMatrix2D(centro, 0.0, scale)
     M[0, 2] += dx
     M[1, 2] += dy
-    im_warp = cv2.warpAffine(im, M, (64, 64), borderMode=cv2.BORDER_CONSTANT, borderValue=0.42)
-    return im_warp
+    im_warp = cv2.warpAffine(im, M, (64, 64), borderMode=cv2.BORDER_REFLECT_101)
+    return aplicar_mascara_eliptica_a_img64(im_warp)
 
 
 def centrar_ventana_en_rostro_pdi(frame_bgr: np.ndarray, cuadrado_base: list, max_shift: int = 75) -> list:

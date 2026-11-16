@@ -1,8 +1,8 @@
 Enfoque,Modelo,Exactitud ent. (%),Error ent. (%),Exactitud prueba (%),Error prueba (%),Brecha (p. p.)
-Clásico (PDI + PCA),SVM,99.92,0.08,97.81,2.19,2.11
-Clásico (PDI + PCA),Random Forest,100.0,0.0,97.34,2.66,2.66
-Clásico (PDI + PCA),k-NN,97.42,2.58,97.03,2.97,0.39
-Clásico (PDI + PCA),CNN (Conv2D),99.8,0.2,96.88,3.12,2.93
-Clásico (PDI + PCA),ANN (MLP),99.88,0.12,97.66,2.34,2.23
-Clásico (PDI + PCA),Árbol de decisión,89.1,10.9,84.84,15.16,4.26
-Deep Learning (Fase Posterior),CNN (Conv2D + MaxPool + FC),99.96,0.04,97.81,2.19,2.15
+Clásico (PDI + PCA),SVM,99.92,0.08,97.97,2.03,1.95
+Clásico (PDI + PCA),Random Forest,100.0,0.0,97.03,2.97,2.97
+Clásico (PDI + PCA),k-NN,97.77,2.23,96.72,3.28,1.05
+Clásico (PDI + PCA),ANN (MLP),99.45,0.55,97.5,2.5,1.95
+Clásico (PDI + PCA),CNN (Conv2D),99.61,0.39,95.78,4.22,3.83
+Clásico (PDI + PCA),Árbol de decisión,90.74,9.26,86.41,13.59,4.34
+Deep Learning (Fase Posterior),CNN (Conv2D + MaxPool + FC),99.69,0.31,97.97,2.03,1.72

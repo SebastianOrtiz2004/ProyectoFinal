@@ -39,6 +39,7 @@ from utils_pdi import (
     ScalerPreservandoVarianza,
     aplicar_mascara_eliptica_a_img64,
     extraer_descriptor_espacial_bloques,
+    extraer_puntos_faciales_landmarks_pdi,
     aumentar_geometria_rostro,
     extraer_mapas_convolucionales_2d,
 )
@@ -390,10 +391,11 @@ def calcular_features_pdi_matriz(X_mat: np.ndarray) -> np.ndarray:
         1. Simetría bilateral adaptable (invariante a giro de cabeza: frente, medio perfil y perfil).
         2. Relación de gradientes Sobel Horizontal vs. Vertical (Ratio_HV).
         3. Descriptor espacial por bloques 4x4 (64 características con Sobel y filtro pasa-altos).
-    Total: 66 características por muestra.
+        4. 12 descriptores de Puntos Faciales (Landmarks anatómicos y proporciones antropométricas).
+    Total: 78 características por muestra.
     """
     N = X_mat.shape[0]
-    feats = np.empty((N, 66), dtype=np.float64)
+    feats = np.empty((N, 78), dtype=np.float64)
     for i in range(N):
         im = X_mat[i].reshape(64, 64)
         # 1. Simetría Adaptable
@@ -413,7 +415,10 @@ def calcular_features_pdi_matriz(X_mat: np.ndarray) -> np.ndarray:
         # 3. Descriptor espacial por bloques 4x4 (64 características)
         desc_bloques = extraer_descriptor_espacial_bloques(im)
 
-        feats[i] = np.concatenate([[sim, ratio_hv], desc_bloques])
+        # 4. 12 descriptores de Puntos Faciales (Landmarks y proporciones antropométricas)
+        landmarks_12, _ = extraer_puntos_faciales_landmarks_pdi(im)
+
+        feats[i] = np.concatenate([[sim, ratio_hv], desc_bloques, landmarks_12])
     return feats
 
 

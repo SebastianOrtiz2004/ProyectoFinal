@@ -24,6 +24,7 @@ from utils_pdi import (
     detectar_rostro_principal,
     ScalerPreservandoVarianza,
     extraer_descriptor_espacial_bloques,
+    extraer_puntos_faciales_landmarks_pdi,
     centrar_ventana_en_rostro_pdi,
     extraer_mapas_convolucionales_2d,
     cv2_imwrite_unicode,
@@ -146,7 +147,8 @@ def extraer_vector_caracteristicas_vivo(pca_model, vector_4096: np.ndarray, scal
     ratio_hv = float(np.mean(gy) / (np.mean(gx) + 1e-6))
 
     desc_bloques = extraer_descriptor_espacial_bloques(im)
-    pdi_feats = np.concatenate([[sim, ratio_hv], desc_bloques]).reshape(1, -1)
+    landmarks_12, _ = extraer_puntos_faciales_landmarks_pdi(im)
+    pdi_feats = np.concatenate([[sim, ratio_hv], desc_bloques, landmarks_12]).reshape(1, -1)
 
     f = np.hstack([z, mse, pdi_feats])
     if scaler is not None:
@@ -648,7 +650,6 @@ def ejecutar_demostracion():
                             im_s, v_s = preprocesar_ventana_64x64(parche_s)
                             if float(np.std(im_s)) > 0.04:
                                 candidatos_lote.append(v_s)
-                                candidatos_lote.append(np.fliplr(im_s).reshape(-1))
 
                 if not candidatos_lote:
                     candidatos_lote.append(vec_4096)
@@ -663,9 +664,9 @@ def ejecutar_demostracion():
                     X_lote = np.array(candidatos_lote, dtype=np.float64)
                     Z_lote = pca_e2.transform(X_lote)  # Proyección matricial vectorizada en batch (< 3 ms)
                     Z_prototipos = np.vstack(matrices_autorizados)
-                    # Distancia euclídea mínima de cada candidato hacia los 250 prototipos
-                    dists_min = np.min(np.linalg.norm(Z_lote[:, None, :] - Z_prototipos[None, :, :], axis=2), axis=1)
-                    best_idx = int(np.argmin(dists_min))
+                    dists_all = np.linalg.norm(Z_lote[:, None, :] - Z_prototipos[None, :, :], axis=2)
+                    dists_top5 = np.mean(np.sort(dists_all, axis=1)[:, :5], axis=1)
+                    best_idx = int(np.argmin(dists_top5))
                     vec_4096 = X_lote[best_idx]
                     img_64 = vec_4096.reshape(64, 64)
 
@@ -700,15 +701,17 @@ def ejecutar_demostracion():
                                 pass
 
                     if lista_probas:
-                        probas_promedio = np.mean(lista_probas, axis=0)
-                        pred_id = int(np.argmax(probas_promedio))
-                        prob_pred = float(np.max(probas_promedio))
+                        probas_vector = np.mean(lista_probas, axis=0)
+                        pred_id = int(np.argmax(probas_vector))
+                        prob_pred = float(np.max(probas_vector))
                     else:
                         f_in_def, _, _ = construir_entrada_modelo(
                             artefactos["mejor_e2_info"], pca_e2, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e2
                         )
                         pred_id = int(artefactos["mejor_e2_info"]["modelo"].predict(f_in_def)[0])
                         prob_pred = 0.85
+                        probas_vector = np.zeros(num_clases_totales)
+                        probas_vector[pred_id] = prob_pred
                 else:
                     # Algoritmo forzado por teclado ([1] a [6])
                     if modelo_fuerza in ["CNN (Deep Learning)", "CNN (Conv2D)"]:
@@ -719,44 +722,57 @@ def ejecutar_demostracion():
                     f_in_e2, _, f_conv_cache = construir_entrada_modelo(
                         info_e2_activo, pca_e2, vec_4096, f_conv_cache=f_conv_cache, scaler_pca_fallback=scaler_pca_respaldo_e2
                     )
-                    v_p = obtener_vector_probabilidades(info_e2_activo["modelo"], f_in_e2, num_clases_totales)
-                    pred_id = int(np.argmax(v_p))
-                    prob_pred = float(np.max(v_p))
+                    probas_vector = obtener_vector_probabilidades(info_e2_activo["modelo"], f_in_e2, num_clases_totales)
+                    pred_id = int(np.argmax(probas_vector))
+                    prob_pred = float(np.max(probas_vector))
 
-                # Verificación Biométrica Dinámica en Subespacio PCA para la clase predicha pred_id
+                # Verificación Biométrica Dinámica en Subespacio PCA para todas las identidades autorizadas
                 z_e2_raw = pca_e2.transform(vec_4096.reshape(1, -1))[0]
                 ultimo_z_e2_raw = z_e2_raw
-                ultimo_pred_id = pred_id
 
-                if pred_id in ids_autorizados and pred_id in perfiles:
-                    perfil_cand = perfiles[pred_id]
-                    mat_poses_cand = perfil_cand.get("matriz_Z_poses", None)
-                    radio_pose_cand = perfil_cand.get("radio_pose", 14.5)
-                    umbral_mse_cand = perfil_cand.get("umbral_mse_clase", max(0.0052, umbral_mse_id))
+                mejor_c_aut = None
+                mejor_conf_raw = -1.0
+                mejor_ratio_d = 999.0
+                mejor_umbral_mse = umbral_mse_id
+                prob_c_ganador = 0.0
 
-                    if mat_poses_cand is not None and len(mat_poses_cand) > 0:
-                        dist_geo = float(np.min(np.linalg.norm(mat_poses_cand - z_e2_raw, axis=1)))
-                    else:
-                        dist_geo = float(np.linalg.norm(z_e2_raw - perfil_cand["centroide"]))
-                    ratio_d = dist_geo / (radio_pose_cand + 1e-6)
+                for c_aut in ids_autorizados:
+                    if c_aut in perfiles:
+                        p_cand = perfiles[c_aut]
+                        mat_p = p_cand.get("matriz_Z_poses", None)
+                        rad_p = p_cand.get("radio_pose", 14.5)
+                        umb_m = p_cand.get("umbral_mse_clase", max(0.0052, umbral_mse_id))
+                        if mat_p is not None and len(mat_p) > 0:
+                            d_all = np.linalg.norm(mat_p - z_e2_raw, axis=1)
+                            d_geo = float(np.mean(np.sort(d_all)[:3]))
+                        else:
+                            d_geo = float(np.linalg.norm(z_e2_raw - p_cand["centroide"]))
+                        r_d = d_geo / (rad_p + 1e-6)
+                        c_geom = float(np.exp(-0.20 * (r_d ** 2)))
+                        prob_c = float(probas_vector[c_aut]) if c_aut < len(probas_vector) else 0.0
+                        c_raw = float(0.58 * prob_c + 0.42 * c_geom)
+                        if c_raw > mejor_conf_raw:
+                            mejor_conf_raw = c_raw
+                            mejor_c_aut = c_aut
+                            mejor_ratio_d = r_d
+                            mejor_umbral_mse = umb_m
+                            prob_c_ganador = prob_c
 
-                    conf_geom = float(np.exp(-0.20 * (ratio_d ** 2)))
-                    conf_raw = float(0.62 * prob_pred + 0.38 * conf_geom)
-
-                    # Verificación biométrica dinámica para la identidad pred_id (hoy ID 0, mañana ID 0, 1, 2...):
-                    if (
-                        ratio_d <= 1.32
-                        and mse_e2 <= umbral_mse_cand
-                        and conf_raw >= 0.52
-                    ):
-                        pred_id_frame = pred_id
-                        conf_frame = float(np.clip(0.90 + (conf_raw - 0.52) / 0.45 * 0.07, 0.90, 0.97))
-                    else:
-                        pred_id_frame = id_desconocido
-                        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, ratio_d - 1.0) * 0.25), 0.75, 0.90))
+                # Autoriza dinámicamente a mejor_c_aut (hoy ID 0, mañana ID 0, 1, 2...) si cumple subespacio + ML:
+                if (
+                    mejor_c_aut is not None
+                    and prob_c_ganador >= 0.36
+                    and mejor_ratio_d <= 1.32
+                    and mse_e2 <= mejor_umbral_mse
+                    and mejor_conf_raw >= 0.50
+                ):
+                    pred_id_frame = mejor_c_aut
+                    ultimo_pred_id = mejor_c_aut
+                    conf_frame = float(np.clip(0.90 + (mejor_conf_raw - 0.50) / 0.45 * 0.07, 0.90, 0.97))
                 else:
                     pred_id_frame = id_desconocido
-                    conf_frame = float(np.clip(prob_pred, 0.72, 0.92))
+                    ultimo_pred_id = id_desconocido
+                    conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, mejor_ratio_d - 1.0) * 0.25), 0.75, 0.90))
 
                 # Acumulación de evidencia en la ventana de verificación temporal (BUFFER_FRAMES = 8)
                 buffer_verificacion.append((pred_id_frame, conf_frame))
@@ -803,6 +819,35 @@ def ejecutar_demostracion():
         # Dibujar cuadrado envolvente y centroide real en la vista de cámara
         cv2.rectangle(frame, (qx, qy), (qx + qlado, qy + qlado), color_cuadro, 2)
         cv2.circle(frame, (cx, cy), 4, color_cuadro, -1)
+
+        # Dibujar landmarks faciales anatómicos y malla triangular sutil si es humano
+        if telemetria.get("es_humano", False) and 'img_64' in locals():
+            try:
+                _, pts_landmarks = extraer_puntos_faciales_landmarks_pdi(img_64)
+                pts_px = {}
+                for k_lm, (lx, ly) in pts_landmarks.items():
+                    px_x = int(qx + lx * qlado / 64.0)
+                    px_y = int(qy + ly * qlado / 64.0)
+                    pts_px[k_lm] = (px_x, px_y)
+
+                color_malla = (255, 255, 0)  # Cian en BGR
+                conexiones = [
+                    ("ojo_izq", "ojo_der"),
+                    ("ojo_izq", "nariz"),
+                    ("ojo_der", "nariz"),
+                    ("nariz", "boca_izq"),
+                    ("nariz", "boca_der"),
+                    ("boca_izq", "boca_der"),
+                ]
+                for p1_k, p2_k in conexiones:
+                    if p1_k in pts_px and p2_k in pts_px:
+                        cv2.line(frame, pts_px[p1_k], pts_px[p2_k], color_malla, 1, cv2.LINE_AA)
+
+                for pt_k in ["ojo_izq", "ojo_der", "nariz", "boca_izq", "boca_der"]:
+                    if pt_k in pts_px:
+                        cv2.circle(frame, pts_px[pt_k], 3, color_malla, -1, cv2.LINE_AA)
+            except Exception:
+                pass
         if etiqueta_texto:
             texto_limpio = limpiar_texto_cv2(etiqueta_texto)
             cv2.putText(
