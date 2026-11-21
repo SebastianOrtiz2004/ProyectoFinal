@@ -1,7 +1,7 @@
 Modelo,Exactitud ent. (%),Error ent. (%),Exactitud val. CV (%),Exactitud prueba (%),Error prueba (%),Brecha (p. p.),Indice_J,Epocas_Ejecutadas,Mejores_Parametros
-SVM,99.8,0.2,97.66,98.59,1.41,1.21,98.59,[1891],"{'C': 3.0, 'gamma': 'scale', 'kernel': 'rbf'}"
-CNN (Conv2D),99.49,0.51,96.75,98.12,1.88,1.37,98.12,29,"{'hidden_layers': (256, 128), 'alpha': 0.08, 'paciencia': 25}"
-k-NN,97.66,2.34,96.21,96.41,3.59,1.25,96.41,N/A,"{'n_neighbors': 5, 'weights': 'uniform'}"
-ANN (MLP),99.45,0.55,96.84,98.12,1.88,1.33,96.12,28,"{'alpha': 0.1, 'hidden_layer_sizes': (128, 64), 'learning_rate_init': 0.001}"
-Random Forest,99.88,0.12,97.27,96.25,3.75,3.63,95.93,N/A,"{'max_depth': 12, 'min_samples_leaf': 2, 'n_estimators': 250}"
-Árbol de decisión,97.03,2.97,93.55,91.88,8.12,5.16,90.8,N/A,"{'criterion': 'entropy', 'max_depth': 6, 'min_samples_leaf': 4}"
+SVM,94.3,5.7,92.66,90.94,9.06,3.36,90.72,[1130],"{'C': 0.28, 'gamma': 'scale', 'kernel': 'rbf'}"
+CNN (Conv2D),95.0,5.0,93.32,91.09,8.91,3.91,90.55,55,"{'alpha': 2.2, 'hidden_layer_sizes': (48, 24), 'learning_rate_init': 0.0008}"
+k-NN,92.73,7.27,91.68,90.16,9.84,2.58,90.16,N/A,"{'n_neighbors': 15, 'weights': 'uniform'}"
+Random Forest,94.18,5.82,92.3,90.31,9.69,3.87,89.79,N/A,"{'max_depth': 6, 'min_samples_leaf': 18, 'n_estimators': 120}"
+ANN (MLP),91.95,8.05,91.76,89.22,10.78,2.73,89.22,31,"{'alpha': 6.5, 'hidden_layer_sizes': (32, 16), 'learning_rate_init': 0.0008}"
+Árbol de decisión,92.97,7.03,91.21,80.78,19.22,12.19,75.27,N/A,"{'criterion': 'gini', 'max_depth': 5, 'min_samples_leaf': 22}"

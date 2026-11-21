@@ -1,0 +1,20 @@
+{
+  "esp32": {
+    "habilitado": true,
+    "ip": "192.168.100.77",
+    "puerto_control": 80,
+    "puerto_stream": 80,
+    "usar_camara_esp32": true,
+    "rotar_180": false,
+    "voltear_horizontal": false
+  },
+  "telegram": {
+    "habilitado": false,
+    "bot_token": "PON_AQUI_TU_TOKEN_DE_BOTFATHER",
+    "chat_id": "PON_AQUI_TU_CHAT_ID",
+    "nombre_lugar": "Laboratorio FISEI - UTA",
+    "cooldown_autorizado_seg": 15,
+    "cooldown_alerta_seg": 15,
+    "enviar_alerta_desconocido": true
+  }
+}

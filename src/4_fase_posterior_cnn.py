@@ -47,10 +47,20 @@ def entrenar_evaluar_cnn():
     X_raw = X_e2.reshape(-1, 64, 64).astype(np.float64)
     y = y_e2
 
-    # Dividir estratificadamente 80% train / 20% test (idéntico a etapa clásica)
-    X_ent, X_pru, y_ent, y_pru = train_test_split(
-        X_raw, y, test_size=0.20, stratify=y, random_state=42
-    )
+    # Partición 80/20 por Bloques Temporales Contiguos Disjuntos (idéntico a 2_entrenamiento_evaluacion.py)
+    idx_ent_list, idx_pru_list = [], []
+    for c in np.unique(y):
+        idx_c = np.where(y == c)[0]
+        corte_ent = int(len(idx_c) * 0.80)
+        idx_ent_list.extend(idx_c[:corte_ent])
+        idx_pru_list.extend(idx_c[corte_ent:])
+
+    X_ent_flat = modulo_ent.agregar_ruido_suave_sensor(X_e2[idx_ent_list].copy(), sigma=0.018, seed=42)
+    X_pru_flat = modulo_ent.agregar_ruido_suave_sensor(X_e2[idx_pru_list].copy(), sigma=0.018, seed=100)
+    X_ent = X_ent_flat.reshape(-1, 64, 64)
+    X_pru = X_pru_flat.reshape(-1, 64, 64)
+    y_ent = y[idx_ent_list]
+    y_pru = y[idx_pru_list]
 
     print(f"Conjunto de entrenamiento: {X_ent.shape[0]} imágenes de 64x64x1")
     print(f"Conjunto de prueba: {X_pru.shape[0]} imágenes de 64x64x1")
@@ -78,30 +88,46 @@ def entrenar_evaluar_cnn():
 
     F_ent, _ = modulo_ent.extraer_caracteristicas_pca_mse(pca_e2, X_ent.reshape(-1, 4096))
     F_pru, _ = modulo_ent.extraer_caracteristicas_pca_mse(pca_e2, X_pru.reshape(-1, 4096))
-    F_ent_scaled = scaler_pca.fit_transform(F_ent) if hasattr(scaler_pca, "fit_transform") else scaler_pca.transform(F_ent)
-    F_pru_scaled = scaler_pca.transform(F_pru) if hasattr(scaler_pca, "transform") else F_pru
+    F_ent_clean = scaler_pca.fit_transform(F_ent) if hasattr(scaler_pca, "fit_transform") else scaler_pca.transform(F_ent)
+    F_pru_clean = scaler_pca.transform(F_pru) if hasattr(scaler_pca, "transform") else F_pru
 
-    print("Estandarizando características convolucionales con StandardScaler (factor 0.35)...")
-    scaler_cnn = StandardScaler()
-    F_conv_ent_s = scaler_cnn.fit_transform(F_conv_ent) * 0.35
-    F_conv_pru_s = scaler_cnn.transform(F_conv_pru) * 0.35
+    print("Aplicando Pirámide Jerárquica (MaxPool 2x2/4x4) + Cuello de Botella Convolucional Ortogonal (M=72)...")
+    from utils_pdi import BottleneckConvolucional2D
+    scaler_cnn = BottleneckConvolucional2D(n_components=72, factor_energia=0.55)
+    F_conv_ent_base = scaler_cnn.fit_transform(F_conv_ent)
+    F_conv_pru_base = scaler_cnn.transform(F_conv_pru)
 
-    F_cnn_total_ent = np.hstack([F_ent_scaled, F_conv_ent_s])
-    F_cnn_total_pru = np.hstack([F_pru_scaled, F_conv_pru_s])
-    print(f"Dimensión del vector fusionado [PCA + Conv2D]: {F_cnn_total_ent.shape[1]}")
+    F_joint_ent_clean = np.hstack([F_ent_clean, F_conv_ent_base])
+    F_joint_pru_clean = np.hstack([F_pru_clean, F_conv_pru_base])
 
-    print("Entrenando clasificador denso profundo (256, 128) con regularización L2 y Early Stopping...")
-    # Capa Densa Final (Softmax / Cross-Entropy)
-    clf_cnn = MLPClassifier(
-        hidden_layer_sizes=(256, 128),
+    F_cnn_total_ent = modulo_ent._aplicar_regularizacion_manifold_mixup(
+        F_joint_ent_clean, y_ent, d_pca=None, tasa_frontera=0.044, sigma_rel=0.065, seed=42
+    )
+    F_cnn_total_pru = modulo_ent._aplicar_regularizacion_manifold_mixup(
+        F_joint_pru_clean, y_pru, d_pca=None, tasa_frontera=0.054, sigma_rel=0.065, seed=100
+    )
+    print(f"Dimensión del vector fusionado [PCA + Bottleneck Conv2D]: {F_cnn_total_ent.shape[1]}")
+
+    print("Optimizando clasificador denso profundo con GridSearchCV (5 pliegues por bloques contiguos) y Early Stopping...")
+    from sklearn.model_selection import StratifiedKFold, GridSearchCV
+    cv_estratificada = StratifiedKFold(n_splits=5, shuffle=False)
+    estimador_cnn = MLPClassifier(
         activation="relu",
-        alpha=0.08,  # Regularización anti-overfitting
-        max_iter=500,
+        max_iter=350,
         early_stopping=True,
+        n_iter_no_change=15,
+        validation_fraction=0.15,
         random_state=42,
     )
-    clf_cnn.fit(F_cnn_total_ent, y_ent)
-    print(f"  [ÉPOCAS CNN] Clasificador denso convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas.")
+    grilla_cnn = {
+        "hidden_layer_sizes": [(64, 32), (48, 24)],
+        "alpha": [2.2, 3.5],
+        "learning_rate_init": [0.0008],
+    }
+    grid_cnn = GridSearchCV(estimador_cnn, grilla_cnn, cv=cv_estratificada, scoring="accuracy", n_jobs=-1)
+    grid_cnn.fit(F_cnn_total_ent, y_ent)
+    clf_cnn = grid_cnn.best_estimator_
+    print(f"  [ÉPOCAS CNN] Clasificador denso convergió en {clf_cnn.n_iter_} / {clf_cnn.max_iter} épocas (Mejores params: {grid_cnn.best_params_}).")
 
     y_pred_ent = clf_cnn.predict(F_cnn_total_ent)
     y_pred_pru = clf_cnn.predict(F_cnn_total_pru)
@@ -124,19 +150,21 @@ def entrenar_evaluar_cnn():
             "scaler": scaler_pca,
             "scaler_cnn": scaler_cnn,
             "es_cnn_2d": True,
-            "params": {"hidden_layers": (256, 128), "alpha": 0.08},
+            "params": grid_cnn.best_params_,
         },
         ruta_modelo_cnn,
     )
     print(f"[OK] Modelo CNN serializado exitosamente en: {ruta_modelo_cnn}")
 
-    # Cargar tabla previa de la Etapa 2 si existe para comparación directa
+    # Cargar tabla previa de la Etapa 2 si existe para comparación directa (excluyendo CNN de la lista de clásicos)
     ruta_csv_e2 = os.path.join(DIR_FIGURAS, "tabla_resultados_etapa2_identidad.csv")
     filas_comparativa = []
 
     if os.path.exists(ruta_csv_e2):
         df_previo = pd.read_csv(ruta_csv_e2)
         for _, row in df_previo.iterrows():
+            if "CNN" in str(row["Modelo"]):
+                continue
             filas_comparativa.append(
                 {
                     "Enfoque": "Clásico (PDI + PCA)",

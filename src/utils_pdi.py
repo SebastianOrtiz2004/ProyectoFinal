@@ -128,15 +128,16 @@ def imfill_holes(mascara_binaria: np.ndarray) -> np.ndarray:
         bw = (mascara_binaria > 127).astype(np.uint8) * 255
 
     h, w = bw.shape
-    # floodFill requiere una máscara auxiliar de tamaño (h+2, w+2)
-    mask_ff = np.zeros((h + 2, w + 2), np.uint8)
+    # Agregar borde exterior de 1 píxel en 0 para que floodFill siempre inunde desde el exterior
+    # incluso si la esquina (0,0) de la máscara original está encendida (255)
+    padded = np.pad(bw, 1, mode="constant", constant_values=0)
+    mask_ff = np.zeros((h + 4, w + 4), np.uint8)
 
-    # Inundación desde la esquina superior izquierda (0,0)
-    im_floodfill = bw.copy()
-    cv2.floodFill(im_floodfill, mask_ff, (0, 0), 255)
+    # Inundación desde el borde exterior garantizado en (0,0)
+    cv2.floodFill(padded, mask_ff, (0, 0), 255)
 
-    # Invertir el resultado de la inundación externa
-    im_floodfill_inv = cv2.bitwise_not(im_floodfill)
+    # Invertir el resultado de la inundación externa y recortar al tamaño original
+    im_floodfill_inv = cv2.bitwise_not(padded[1:-1, 1:-1])
 
     # La unión lógica sella todas las cavidades internas
     bw_rellena = cv2.bitwise_or(bw, im_floodfill_inv)
@@ -239,17 +240,26 @@ def reducir_por_mediana_bloque(imagen: np.ndarray, alto_dest: int = 64, ancho_de
     return np.median(blocks, axis=(1, 3)).astype(np.float64)
 
 
+_MASCARA_ELIPTICA_64_CACHE = None
+_MASCARA_ELIPTICA_64_BOOL = None
+_CLAHE_CACHE = None
+
+
 def obtener_mascara_eliptica_64() -> np.ndarray:
     """
-    Genera una máscara elíptica suave en float64 de tamaño (64, 64):
+    Genera (con caché en memoria) una máscara elíptica suave en float64 de tamaño (64, 64):
     Valor 1.0 en la elipse facial central (centro=(32, 32), ejes=(23, 29))
     y transición suave (GaussianBlur 5x5) hacia 0.0 en las esquinas exteriores.
     Elimina los artefactos de fondo de la habitación (pared, respaldar de cama, hombros).
     """
-    mask = np.zeros((64, 64), dtype=np.float64)
-    cv2.ellipse(mask, (32, 32), (23, 29), 0, 0, 360, 1.0, -1)
-    mask_suave = cv2.GaussianBlur(mask, (5, 5), 1.0)
-    return np.clip(mask_suave, 0.0, 1.0)
+    global _MASCARA_ELIPTICA_64_CACHE, _MASCARA_ELIPTICA_64_BOOL
+    if _MASCARA_ELIPTICA_64_CACHE is None:
+        mask = np.zeros((64, 64), dtype=np.float64)
+        cv2.ellipse(mask, (32, 32), (23, 29), 0, 0, 360, 1.0, -1)
+        mask_suave = cv2.GaussianBlur(mask, (5, 5), 1.0)
+        _MASCARA_ELIPTICA_64_CACHE = np.clip(mask_suave, 0.0, 1.0)
+        _MASCARA_ELIPTICA_64_BOOL = _MASCARA_ELIPTICA_64_CACHE > 0.50
+    return _MASCARA_ELIPTICA_64_CACHE
 
 
 def aplicar_mascara_eliptica_a_img64(img_64_double: np.ndarray) -> np.ndarray:
@@ -263,24 +273,49 @@ def aplicar_mascara_eliptica_a_img64(img_64_double: np.ndarray) -> np.ndarray:
     return np.clip(img_enmascarada, 0.0, 1.0)
 
 
+def normalizar_fotometria_elipse_64(
+    img_64_double: np.ndarray,
+    media_objetivo: float = 0.44,
+    std_objetivo: float = 0.16,
+) -> np.ndarray:
+    """
+    Normalización Fotométrica Canónica (Z-score intracraneal en la elipse facial):
+    Alinea la media y la desviación estándar de luminancia dentro de la elipse facial
+    para lograr invarianza real frente a iluminación extrema (cuarto oscuro, aula brillante,
+    contraluz o sobreexposición del sensor OV2640).
+    Si la textura interior es completamente plana (std < 0.028, ej. pared lisa), NO amplifica ruido.
+    """
+    mascara = obtener_mascara_eliptica_64()
+    vals = img_64_double[_MASCARA_ELIPTICA_64_BOOL]
+    std_int = float(np.std(vals))
+    if std_int < 0.028:
+        return aplicar_mascara_eliptica_a_img64(img_64_double)
+    media_int = float(np.mean(vals))
+    escala = float(np.clip(std_objetivo / max(std_int, 1e-4), 0.45, 2.60))
+    img_norm = (img_64_double - media_int) * escala + media_objetivo
+    return aplicar_mascara_eliptica_a_img64(np.clip(img_norm, 0.0, 1.0))
+
+
 def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
     """
-    Pipeline PDI Clásico de Cátedra sobre la ventana cuadrada:
+    Pipeline PDI Clásico de Cátedra con Invarianza Fotométrica sobre la ventana cuadrada:
         1. Conversión a escala de grises uint8 [0, 255].
-        2. Mitigación de ruido: Filtro de mediana 3x3 (mitiga ruido impulsivo preservando orillas).
-        3. Suavizado gaussiano ligero (sigma=1.0, kernel 3x3).
-        4. Control adaptativo de contraste:
-           - Si std_cruda < 12.0 (pared lisa / textura plana sin contraste real), NO aplica equalizeHist
-             para evitar inflar el ruido y convertir una pared vacía en falso rostro.
-           - Si std_cruda >= 12.0 (rostro real), aplica ecualización balanceada suave (0.6 eq + 0.4 gauss).
-        5. Reducción espacial de cátedra por MEDIANA DE BLOQUE VECTORIZADA a 64x64.
-        6. Conversión a precisión continua double en [0.0, 1.0].
-        7. Aplicación obligatoria de máscara elíptica suave: neutraliza el fondo exterior con 0.42.
+        2. Mitigación de ruido: Filtro de mediana 3x3 + Suavizado gaussiano ligero.
+        3. Estiramiento adaptativo de rango dinámico (percentiles 2-98) + CLAHE local:
+           - Recupera contraste facial en habitaciones oscuras (p98 bajo) y controla
+             sobreexposición en habitaciones muy iluminadas, sin inflar paredes planas (std < 9.0).
+        4. Reducción espacial de cátedra por MEDIANA DE BLOQUE VECTORIZADA a 64x64.
+        5. Conversión a precisión continua double en [0.0, 1.0].
+        6. Normalización fotométrica Z-score dentro de la elipse facial + máscara elíptica suave.
 
     Retorna:
         - img_64x64_double: Matriz np.ndarray de tamaño (64, 64) en np.float64.
         - vector_4096: Vector fila aplanado np.ndarray de 4096 elementos en np.float64.
     """
+    global _CLAHE_CACHE
+    if _CLAHE_CACHE is None:
+        _CLAHE_CACHE = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(4, 4))
+
     if len(parche_bgr_o_gris.shape) == 3:
         gris_uint8 = cv2.cvtColor(parche_bgr_o_gris, cv2.COLOR_BGR2GRAY)
     else:
@@ -291,32 +326,53 @@ def preprocesar_ventana_64x64(parche_bgr_o_gris: np.ndarray):
 
     std_cruda = float(np.std(gris_uint8))
 
-    # Mitigación de ruido de cátedra
+    # Mitigación de ruido de cátedra (elimina ruido impulsivo y bloques JPEG del ESP32-CAM)
     filtrada_mediana = cv2.medianBlur(gris_uint8, 3)
-    filtrada_gauss = cv2.GaussianBlur(filtrada_mediana, (3, 3), 1.0)
+    filtrada_gauss = cv2.GaussianBlur(filtrada_mediana, (3, 3), 0.9)
 
-    # Ecualización adaptativa para evitar inflar paredes lisas
-    if std_cruda < 12.0:
+    # Ecualización local adaptativa (CLAHE) + realce suave de bordes (Unsharp Mask)
+    # Permite operar desde baja iluminación (cuarto oscuro) hasta alta iluminación (aula brillante)
+    # sin inflar ruido en paredes lisas (std_cruda < 9.0).
+    if std_cruda < 9.0:
         ecualizada = filtrada_gauss
     else:
-        eq_pura = cv2.equalizeHist(filtrada_gauss)
-        ecualizada = cv2.addWeighted(eq_pura, 0.6, filtrada_gauss, 0.4, 0.0)
+        # Estiramiento lineal robusto por percentiles antes de CLAHE para rescatar detalles en cuartos oscuros
+        p2, p98 = np.percentile(filtrada_gauss, (2, 98))
+        rango = float(p98 - p2)
+        if rango >= 16.0 and (p98 < 145.0 or p2 > 75.0):
+            base_eq = np.clip((filtrada_gauss.astype(np.float32) - p2) * (225.0 / rango) + 15.0, 0, 255).astype(np.uint8)
+        else:
+            base_eq = filtrada_gauss
+
+        eq_local = _CLAHE_CACHE.apply(base_eq)
+        ecualizada = cv2.addWeighted(eq_local, 0.65, base_eq, 0.35, 0.0)
+        blur_ref = cv2.GaussianBlur(ecualizada, (3, 3), 1.0)
+        ecualizada = cv2.addWeighted(ecualizada, 1.20, blur_ref, -0.20, 0.0)
 
     # Reducción espacial por MEDIANA DE BLOQUE vectorizada a 64x64
     img_64x64_mediana = reducir_por_mediana_bloque(ecualizada, 64, 64)
 
-    # Conversión explícita a double [0.0, 1.0]
+    # Conversión explícita a double [0.0, 1.0] + normalización fotométrica canónica en elipse
     img_64x64_base = np.clip(img_64x64_mediana / 255.0, 0.0, 1.0)
-
-    # Aplicación obligatoria de máscara elíptica suave: neutraliza el fondo exterior con 0.42
-    mascara = obtener_mascara_eliptica_64()
-    img_64x64_double = img_64x64_base * mascara + 0.42 * (1.0 - mascara)
-    img_64x64_double = np.clip(img_64x64_double, 0.0, 1.0)
+    img_64x64_double = normalizar_fotometria_elipse_64(img_64x64_base)
     vector_4096 = img_64x64_double.reshape(-1)
 
     return img_64x64_double, vector_4096
 
-    return img_64x64_double, vector_4096
+
+def calcular_nitidez_laplaciano(parche_bgr_o_gris: np.ndarray) -> float:
+    """
+    Mide la nitidez óptica de una ventana mediante la varianza del Laplaciano (PDI clásico).
+    Permite descartar fotogramas movidos o desenfocados durante la adquisición con ESP32-CAM.
+    """
+    if parche_bgr_o_gris is None or parche_bgr_o_gris.size == 0:
+        return 0.0
+    if len(parche_bgr_o_gris.shape) == 3:
+        gris = cv2.cvtColor(parche_bgr_o_gris, cv2.COLOR_BGR2GRAY)
+    else:
+        gris = parche_bgr_o_gris
+    gris_norm = cv2.resize(gris, (128, 128), interpolation=cv2.INTER_AREA)
+    return float(cv2.Laplacian(gris_norm, cv2.CV_64F).var())
 
 
 def calcular_iou(caja_a, caja_b):
@@ -842,30 +898,58 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     B_nuc = B[12:52, 14:50]
     gris_nuc = gris[12:52, 14:50]
 
+    # Compensación de desvío global verdoso del sensor OV2640 (ESP32-CAM) bajo luz de pantalla/LED nocturna:
+    med_r = float(np.median(R_nuc))
+    med_g = float(np.median(G_nuc))
+    bias_ov2640_g = float(np.clip(med_g - med_r, 0.0, 0.16)) if (med_g < 0.72 and med_r > 0.10) else 0.0
+
+    # Ganancia fotométrica local adaptativa: permite evaluar rostros reales en cuartos oscuros (p95~0.20)
+    # y en aulas muy iluminadas (p95~0.99) con el mismo rigor geométrico.
+    p95_nuc = float(np.percentile(gris_nuc, 95))
+    p10_nuc = float(np.percentile(gris_nuc, 10))
+    if p95_nuc < 0.075 or (p95_nuc - p10_nuc) < 0.042:
+        return False, {"motivo_rechazo": "Objeto oscuro o superficie sin relieve", "sim_bilateral": 0.0}
+    gain_loc = float(np.clip(0.75 / max(p95_nuc, 0.08), 0.75, 4.2))
+    gris_rel = np.clip(gris * gain_loc, 0.0, 1.0)
+    gris_nuc_rel = gris_rel[12:52, 14:50]
+
     # 1a. Etiquetas verdes/cian/azules intensas de botellas/objetos en el centro facial:
-    bw_croma_artificial = ((G_nuc - R_nuc) > 0.085) | ((B_nuc - R_nuc) > 0.095)
+    bw_croma_artificial = (((G_nuc - R_nuc) - bias_ov2640_g) > 0.090) | ((B_nuc - R_nuc) > 0.100)
     # 1b. Cabello plástico amarillo/naranja/rojo chillón de muñecos de anime (ej. Rengoku) en corona:
     R_cor = R[6:36, 12:52]
     G_cor = G[6:36, 12:52]
     B_cor = B[6:36, 12:52]
     bw_muneco_neon = (R_cor > 0.68) & (B_cor < 0.24) & ((R_cor - B_cor) > 0.42) & (G_cor > 0.42)
-    # 1c. Corona blanca brillante de muñeco de lana (ej. Gojo) más clara que la cara:
-    corona_blanca = float(np.mean((gris[4:30, 12:52] > 0.78) & (np.abs(R[4:30, 12:52] - B[4:30, 12:52]) < 0.06)))
+    # 1c. Corona blanca brillante de muñeco de lana (ej. Gojo) MUCHO más clara que la cara inferior:
+    # (No penaliza frentes humanas sobreexpuestas donde la cara inferior también está muy iluminada)
+    corona_blanca = float(np.mean((gris[4:26, 12:52] > 0.80) & (np.abs(R[4:26, 12:52] - B[4:26, 12:52]) < 0.06)))
+    cara_inf_oscura = float(np.mean(gris[34:54, 16:48])) < 0.52
+    # 1d. Carteles o señalética rojo puro sobre fondo blanco (ej. señal de Prohibido Fumar en pared):
+    bw_rojo_cartel = (R_nuc > 0.52) & ((R_nuc - G_nuc) > 0.28) & ((R_nuc - B_nuc) > 0.28)
+    fondo_blanco_cartel = float(np.mean((gris_nuc > 0.80) & (np.abs(R_nuc - B_nuc) < 0.08)))
+    # 1e. Gráficos/portadas impresas amarillo brillante o magenta/morado (ej. cuadernos, cajas de lápices):
+    bw_grafico_impreso = (
+        ((R_nuc > 0.50) & (G_nuc > 0.45) & (B_nuc < 0.35) & ((R_nuc - B_nuc) > 0.26) & ((G_nuc - B_nuc) > 0.20))
+        | ((B_nuc > G_nuc + 0.03) & (R_nuc > G_nuc + 0.03))
+    )
 
     if (
-        float(np.mean(bw_croma_artificial)) > 0.14
+        float(np.mean(bw_croma_artificial)) > 0.15
         or float(np.mean(bw_muneco_neon)) > 0.14
-        or corona_blanca > 0.32
+        or (corona_blanca > 0.36 and cara_inf_oscura)
+        or float(np.mean(bw_rojo_cartel)) > 0.06
+        or (fondo_blanco_cartel > 0.38 and float(np.mean(bw_rojo_cartel)) > 0.02)
+        or float(np.mean(bw_grafico_impreso)) > 0.08
     ):
-        return False, {"motivo_rechazo": "Color artificial (Muneco/Botella/Objeto)", "sim_bilateral": 0.0}
+        return False, {"motivo_rechazo": "Color artificial (Muneco/Cartel/Cuaderno)", "sim_bilateral": 0.0}
 
-    # 2. Bloquear objetos negros sólidos en el núcleo central (perfumes o controles oscuros):
-    if float(np.mean(gris_nuc < 0.14)) > 0.34:
+    # 2. Bloquear objetos negros sólidos o recortes desplazados a cuello/ropa oscura (invariante a luz ambiental):
+    if float(np.mean(gris_nuc_rel < 0.16)) > 0.42:
         return False, {"motivo_rechazo": "Objeto oscuro en el centro", "sim_bilateral": 0.0}
 
     # 3. Bloquear líneas verticales continuas de puertas/paredes/pizarras:
-    perfil_sup = np.mean(gris[6:16, 12:52], axis=0)
-    perfil_med = np.mean(gris[20:30, 12:52], axis=0)
+    perfil_sup = np.mean(gris_rel[6:16, 12:52], axis=0)
+    perfil_med = np.mean(gris_rel[20:30, 12:52], axis=0)
     if float(np.std(perfil_sup)) > 1e-4 and float(np.std(perfil_med)) > 1e-4:
         c_mat = np.corrcoef(perfil_sup, perfil_med)
         corr_v = float(c_mat[0, 1]) if not np.isnan(c_mat[0, 1]) else 0.0
@@ -878,59 +962,422 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
         w_s = min(cx - 8, 56 - cx)
         if w_s < 10:
             continue
-        l_sub = gris[14:48, cx - w_s : cx]
-        r_sub = np.fliplr(gris[14:48, cx : cx + w_s])
+        l_sub = gris_rel[14:48, cx - w_s : cx]
+        r_sub = np.fliplr(gris_rel[14:48, cx : cx + w_s])
         l_zero = l_sub - np.mean(l_sub)
         r_zero = r_sub - np.mean(r_sub)
         sim_n = 1.0 - float(np.mean(np.abs(l_zero - r_zero)))
         if sim_n > mejor_sim_norm:
             mejor_sim_norm = sim_n
 
-    std_izq = float(np.std(gris[14:48, 12:32])) * 255.0
-    std_der = float(np.std(gris[14:48, 32:52])) * 255.0
-    if min(std_izq, std_der) < 5.2 or mejor_sim_norm < 0.75:
+    std_izq = float(np.std(gris_rel[14:48, 12:32])) * 255.0
+    std_der = float(np.std(gris_rel[14:48, 32:52])) * 255.0
+    if min(std_izq, std_der) < 5.0 or mejor_sim_norm < 0.72:
         return False, {"motivo_rechazo": "Fondo liso / Objeto lateral asimetrico", "sim_bilateral": mejor_sim_norm}
 
-    # 5. Textura ocular y cejas en tercio superior-medio:
-    franja_ocular = gris[14:36, 12:52]
+    # 5. Textura ocular y cejas en tercio superior-medio (evaluado en gris_rel):
+    franja_ocular = gris_rel[12:38, 10:54]
     gy_ojos = float(np.mean(np.abs(cv2.Sobel(franja_ocular, cv2.CV_64F, 0, 1, ksize=3))))
     gx_ojos = float(np.mean(np.abs(cv2.Sobel(franja_ocular, cv2.CV_64F, 1, 0, ksize=3))))
-    if gy_ojos < 0.013 or gy_ojos < 0.44 * (gx_ojos + 1e-6):
+    if gy_ojos < 0.012 or gy_ojos < 0.55 * (gx_ojos + 1e-6):
         return False, {"motivo_rechazo": "Sin estructura horizontal de cejas/ojos", "sim_bilateral": mejor_sim_norm}
 
     # Presencia de rasgos oscuros (pupilas/pestañas/cejas) respecto a la piel:
-    mediana_cara = float(np.median(gris[14:50, 14:50]))
-    ojo_izq = gris[14:36, 12:32]
-    ojo_der = gris[14:36, 32:52]
+    mediana_cara = float(np.median(gris_rel[14:50, 14:50]))
+    ojo_izq = gris_rel[12:38, 10:32]
+    ojo_der = gris_rel[12:38, 32:54]
     p10_izq = float(np.percentile(ojo_izq, 10))
     p10_der = float(np.percentile(ojo_der, 10))
-    if max(p10_izq, p10_der) > max(0.55, mediana_cara * 0.95):
+    if max(p10_izq, p10_der) > max(0.60, mediana_cara * 0.96):
         return False, {"motivo_rechazo": "Superficie lisa sin ojos ni cejas (Mano/Puno)", "sim_bilateral": mejor_sim_norm}
 
-    # 6. Presencia de nariz y labios en zona media-inferior:
-    zona_boca = gris[34:54, 16:48]
+    # 6. Presencia de nariz y labios en zona media-inferior (evaluado en gris_rel):
+    zona_boca = gris_rel[32:56, 14:50]
     gy_boca = float(np.mean(np.abs(cv2.Sobel(zona_boca, cv2.CV_64F, 0, 1, ksize=3))))
-    if gy_boca < 0.012 or (float(np.percentile(zona_boca, 90)) - float(np.percentile(zona_boca, 10))) < 0.06:
+    if gy_boca < 0.011 or (float(np.percentile(zona_boca, 90)) - float(np.percentile(zona_boca, 10))) < 0.055:
         return False, {"motivo_rechazo": "Sin nariz ni labios (Puno/Mano/Pared)", "sim_bilateral": mejor_sim_norm}
 
-    # 7. Crominancia de piel humana en la región central (con ganancia adaptativa a luz tenue o fuerte):
-    p95 = float(np.percentile(gris_nuc, 95))
-    gain = np.clip(0.75 / max(p95, 0.15), 0.9, 2.2)
-    R_n = np.clip(R_nuc * gain, 0, 1)
-    G_n = np.clip(G_nuc * gain, 0, 1)
-    B_n = np.clip(B_nuc * gain, 0, 1)
-    gris_n = np.clip(gris_nuc * gain, 0, 1)
+    # 7. Crominancia de piel humana en la región central (invariante a baja luz Y sobreexposición OV2640):
+    R_n = np.clip(R_nuc * gain_loc, 0, 1)
+    G_n = np.clip((G_nuc - bias_ov2640_g) * gain_loc, 0, 1)
+    B_n = np.clip(B_nuc * gain_loc, 0, 1)
+    gris_n = gris_nuc_rel
     bw_piel = (
-        (R_n > 0.16) & (G_n > 0.09) & (B_n > 0.05)
-        & ((R_n - G_n) >= 0.002) & ((R_n - G_n) <= 0.45)
-        & ((R_n - B_n) >= 0.008)
-        & (gris_n > 0.14) & (gris_n < 0.94)
+        (R_n > 0.14) & (G_n > 0.08) & (B_n > 0.04)
+        & ((R_n - G_n) >= -0.030) & ((R_n - G_n) <= 0.46)
+        & ((R_n - B_n) >= -0.025)
+        & (gris_n > 0.12) & (gris_n <= 1.0)
     )
-    piel_centro = float(np.mean(bw_piel))
-    if piel_centro < 0.22:
-        return False, {"motivo_rechazo": "Sin crominancia de piel humana en la elipse", "sim_bilateral": mejor_sim_norm}
+    # Incluir píxeles de piel sobreexpuestos (casi blancos por auto-exposición fuerte) si conservan tono cálido/neutro
+    bw_piel_brillante = (gris_nuc > 0.80) & (R_nuc >= B_nuc - 0.03) & (np.abs(R_nuc - G_nuc) <= 0.09)
+    mask_piel_nuc = bw_piel | bw_piel_brillante
+    piel_centro = float(np.mean(mask_piel_nuc))
+    piel_superior = float(np.mean(mask_piel_nuc[4:24, 2:34]))
+    # Continuidad facial en núcleo central (nariz/mejillas) y los 4 cuadrantes:
+    # Bloquea manos/dedos sosteniendo objetos (tienen huecos oscuros o un cuadrante vacío),
+    # mientras cualquier rostro humano real supera 0.78 en núcleo y 0.65 en los 4 cuadrantes.
+    piel_core = float(np.mean(mask_piel_nuc[8:32, 8:28]))
+    q_min_piel = min(
+        float(np.mean(mask_piel_nuc[:20, :18])),
+        float(np.mean(mask_piel_nuc[:20, 18:])),
+        float(np.mean(mask_piel_nuc[20:, :18])),
+        float(np.mean(mask_piel_nuc[20:, 18:])),
+    )
+    if piel_centro < 0.48 or piel_superior < 0.44 or piel_core < 0.62 or q_min_piel < 0.45:
+        return False, {"motivo_rechazo": "Sin continuidad facial en 4 cuadrantes (Mano/Objeto/Cuaderno)", "sim_bilateral": mejor_sim_norm}
 
     return True, {"sim_bilateral": mejor_sim_norm, "motivo_rechazo": ""}
+
+
+def aplicar_nms_cajas(cajas: list, puntajes: list, umbral_iou: float = 0.32, umbral_contencion: float = 0.55) -> list:
+    """
+    Supresión de No-Máximos (NMS) y Supresión Anatómica de Torso/Cuello sobre ventanas candidatas [x, y, w, h]:
+    1. Elimina sub-ventanas más pequeñas ubicadas directamente debajo de una cabeza superior
+       (zona de cuello, capucha o solapa de chaqueta de la misma persona).
+    2. Reutiliza calcular_iou y verifica también la razón de contención (intersección / área mínima)
+       para eliminar cajas duplicadas o anidadas sobre el mismo rostro sin fusionar a dos personas
+       distintas ubicadas lado a lado.
+
+    Retorna los índices ordenados de las cajas seleccionadas.
+    """
+    if not cajas:
+        return []
+
+    n_c = len(cajas)
+    es_cuello_inferior = [False] * n_c
+    for i in range(n_c):
+        xi, yi, li, _ = cajas[i]
+        cxi = xi + li * 0.5
+        cyi = yi + li * 0.5
+        for k in range(n_c):
+            if i == k:
+                continue
+            xk, yk, lk, _ = cajas[k]
+            cxk = xk + lk * 0.5
+            cyk = yk + lk * 0.5
+            # Si la caja i es más pequeña y cae en la columna de cuello/pecho/chaqueta debajo de la cabeza k:
+            if (
+                li <= lk * 0.88
+                and abs(cxi - cxk) <= lk * 0.78
+                and cyi >= cyk + lk * 0.45
+                and cyi <= cyk + lk * 1.65
+            ):
+                es_cuello_inferior[i] = True
+                break
+
+    orden = np.argsort(np.asarray(puntajes, dtype=np.float64))[::-1]
+    seleccionados = []
+
+    for idx in orden:
+        idx = int(idx)
+        if es_cuello_inferior[idx]:
+            continue
+        ca = cajas[idx]
+        area_a = max(1.0, float(ca[2] * ca[3]))
+        descartar = False
+
+        for j in seleccionados:
+            cb = cajas[j]
+            if calcular_iou(ca, cb) >= umbral_iou:
+                descartar = True
+                break
+
+            # Verificar contención (caja pequeña dentro de caja grande sobre la misma cara)
+            xa = max(ca[0], cb[0])
+            ya = max(ca[1], cb[1])
+            xb = min(ca[0] + ca[2], cb[0] + cb[2])
+            yb = min(ca[1] + ca[3], cb[1] + cb[3])
+            inter = max(0, xb - xa) * max(0, yb - ya)
+            area_b = max(1.0, float(cb[2] * cb[3]))
+            contencion = float(inter) / min(area_a, area_b)
+            if contencion >= umbral_contencion:
+                descartar = True
+                break
+
+        if not descartar:
+            seleccionados.append(idx)
+
+    return seleccionados
+
+
+def dividir_blob_compuesto_pdi(bbox: list, bw_piel: np.ndarray, profundidad: int = 0) -> list:
+    """
+    Divide un blob de piel anormalmente ancho (ej. dos o tres personas hombro con hombro)
+    analizando los valles verticales de la proyección horizontal de píxeles de piel.
+    Retorna una lista de sub-cajas [x, y, w, h] ajustadas a cada componente facial.
+    """
+    x, y, w, h = [int(v) for v in bbox]
+    if w <= 12 or h <= 12 or profundidad >= 2:
+        return [[x, y, w, h]]
+
+    # Si la relación ancho/alto es normal para un solo rostro, no dividir
+    if w <= int(h * 1.40):
+        return [[x, y, w, h]]
+
+    sub_mask = bw_piel[y : y + h, x : x + w]
+    perfil_x = np.sum(sub_mask > 0, axis=0).astype(np.float64)
+    if len(perfil_x) < 10:
+        return [[x, y, w, h]]
+
+    # Suavizado ligero del perfil horizontal
+    k_s = np.ones(5, dtype=np.float64) / 5.0
+    perfil_suave = np.convolve(perfil_x, k_s, mode="same")
+
+    ini = max(2, int(w * 0.22))
+    fin = min(w - 2, int(w * 0.78))
+    if fin <= ini:
+        return [[x, y, w, h]]
+
+    rel_valle = int(np.argmin(perfil_suave[ini:fin])) + ini
+    valle = float(perfil_suave[rel_valle])
+    pico_izq = float(np.max(perfil_suave[:rel_valle])) if rel_valle > 0 else 0.0
+    pico_der = float(np.max(perfil_suave[rel_valle:])) if rel_valle < w else 0.0
+    pico_ref = min(pico_izq, pico_der)
+
+    debe_dividir = (pico_ref > 1e-3 and valle < 0.68 * pico_ref) or (w > int(h * 1.95))
+    if not debe_dividir:
+        return [[x, y, w, h]]
+
+    sub_cajas = []
+    for (c0, c1) in [(0, rel_valle), (rel_valle, w)]:
+        if (c1 - c0) < 10:
+            continue
+        trozo = sub_mask[:, c0:c1]
+        ys, xs = np.nonzero(trozo > 0)
+        if len(xs) < 40:
+            continue
+        nx = x + c0 + int(np.min(xs))
+        ny = y + int(np.min(ys))
+        nw = int(np.max(xs) - np.min(xs)) + 1
+        nh = int(np.max(ys) - np.min(ys)) + 1
+        if nw >= 10 and nh >= 10:
+            sub_cajas.extend(dividir_blob_compuesto_pdi([nx, ny, nw, nh], bw_piel, profundidad + 1))
+
+    return sub_cajas if sub_cajas else [[x, y, w, h]]
+
+
+def proponer_ventanas_rostros_pdi(
+    frame_bgr: np.ndarray,
+    max_candidatos: int = 32,
+    incluir_rejilla_respaldo: bool = True,
+) -> list:
+    """
+    Generador Multi-Rostro 100% PDI Clásico (Sin clasificadores preentrenados):
+    1. Segmentación cromática combinada de piel (YCrCb + RGB double con ganancia adaptativa)
+       en resolución reducida (320x240) para máxima velocidad en CPU.
+    2. Limpieza morfológica (Apertura + Cierre + imfill_holes) y extracción de TODAS las
+       componentes conexas (connectedComponentsWithStats).
+    3. Separación de blobs compuestos (personas juntas) mediante valles de proyección horizontal.
+    4. Expansión anatómica al cuadrado envolvente de cabeza completa (coronilla/cabello a mentón)
+       en 2-3 escalas locales para alinear exactamente con el dataset de entrenamiento 64x64.
+    5. Rejilla ligera de respaldo multi-escala en caso de iluminación extrema o fondos cálidos.
+
+    Retorna una lista de ventanas cuadradas candidatas [qx, qy, qlado, qlado].
+    """
+    H, W = frame_bgr.shape[:2]
+    min_dim = min(H, W)
+    lado_min = max(54, int(min_dim * 0.12))
+    lado_max = int(min_dim * 0.72)
+
+    propuestas = []
+
+    def _agregar_si_nueva(caja_cand, umbral_dup=0.76):
+        qx_c, qy_c, ql_c, _ = caja_cand
+        if ql_c < lado_min or ql_c > min_dim:
+            return
+        for ex in propuestas:
+            if calcular_iou(caja_cand, ex) >= umbral_dup:
+                return
+        propuestas.append([int(qx_c), int(qy_c), int(ql_c), int(ql_c)])
+
+    if len(frame_bgr.shape) == 3:
+        w_s, h_s = 320, 240
+        sx = float(W) / float(w_s)
+        sy = float(H) / float(h_s)
+        small = cv2.resize(frame_bgr, (w_s, h_s), interpolation=cv2.INTER_AREA)
+
+        # Canal A: Crominancia YCrCb en imagen original (preserva bordes limpios sin fusionar ropa cálida)
+        pdi = descomponer_rgb_a_double(small)
+        R, G, B, gris = pdi["R_double"], pdi["G_double"], pdi["B_double"], pdi["gris_double"]
+        p95 = float(np.percentile(gris, 95))
+        gain = float(np.clip(0.72 / max(p95, 0.10), 0.9, 3.2))
+
+        ycrcb = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+        Y_c = ycrcb[:, :, 0]
+        Cr = ycrcb[:, :, 1]
+        Cb = ycrcb[:, :, 2]
+        mask_ycrcb = (Y_c >= 20) & (Y_c <= 255) & (Cr >= 129) & (Cr <= 175) & (Cb >= 76) & (Cb <= 128)
+
+        # Canal B: Crominancia RGB double adaptativa (invariante a baja iluminación y tinte OV2640)
+        R_n = np.clip(R * gain, 0.0, 1.0)
+        G_n = np.clip(G * gain, 0.0, 1.0)
+        B_n = np.clip(B * gain, 0.0, 1.0)
+        gris_n = np.clip(gris * gain, 0.0, 1.0)
+        no_rojo_cartel = ~((R_n > 0.55) & ((R_n - G_n) > 0.30) & (G_n < 0.36))
+        mask_rgb = (
+            (R_n > 0.16) & (G_n > 0.10) & (B_n > 0.05)
+            & ((R_n - G_n) >= 0.010) & ((R_n - G_n) <= 0.36)
+            & ((R_n - B_n) >= 0.045)
+            & (gris_n > 0.14) & (gris_n <= 1.0)
+            & no_rojo_cartel
+        )
+
+        bw_piel = ((mask_ycrcb & no_rojo_cartel) | (mask_rgb & (Cr >= 128) & (Cr <= 176) & (Cb <= 129))).astype(np.uint8) * 255
+
+        # Limpieza morfológica: apertura separa dedos/ruido, cierre une ojos/lentes dentro de la cara
+        k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        bw_piel = cv2.morphologyEx(bw_piel, cv2.MORPH_OPEN, k_open, iterations=1)
+        bw_piel = cv2.morphologyEx(bw_piel, cv2.MORPH_CLOSE, k_close, iterations=1)
+        bw_piel = imfill_holes(bw_piel)
+
+        mascaras_candidatas = [bw_piel]
+
+        # Canal B2 (Baja iluminación extrema, p95 < 0.35): YCrCb sobre imagen amplificada como canal adicional
+        if p95 < 0.35:
+            small_low = np.clip(small.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+            yc_low = cv2.cvtColor(small_low, cv2.COLOR_BGR2YCrCb)
+            m_low = (
+                (yc_low[:, :, 0] >= 25) & (yc_low[:, :, 0] <= 245)
+                & (yc_low[:, :, 1] >= 134) & (yc_low[:, :, 1] <= 174)
+                & (yc_low[:, :, 2] >= 78) & (yc_low[:, :, 2] <= 126)
+                & no_rojo_cartel
+            ).astype(np.uint8) * 255
+            m_low = cv2.morphologyEx(m_low, cv2.MORPH_OPEN, k_open, iterations=1)
+            m_low = cv2.morphologyEx(m_low, cv2.MORPH_CLOSE, k_close, iterations=1)
+            m_low = imfill_holes(m_low)
+            mascaras_candidatas.append(m_low)
+
+        # Canal C: Compensación para sensor OV2640 (ESP32-CAM) bajo luz nocturna/pantalla con tinte verdoso (G >= R)
+        if float(np.mean(G)) >= float(np.mean(R)) * 0.90:
+            p75_izq = max(55.0, min(130.0, float(np.percentile(Y_c[:, : w_s // 2], 75))))
+            p75_der = max(55.0, min(130.0, float(np.percentile(Y_c[:, w_s // 2 :], 75))))
+            umbral_y_loc = np.zeros_like(Y_c, dtype=np.float64)
+            umbral_y_loc[:, : w_s // 2] = p75_izq
+            umbral_y_loc[:, w_s // 2 :] = p75_der
+            mask_ov2640 = (
+                (Y_c >= umbral_y_loc) & (Y_c < 205)
+                & (Cr >= 108) & (Cr <= 138)
+                & (Cb >= 96) & (Cb <= 134)
+                & (G >= R * 0.93)
+                & no_rojo_cartel
+            )
+            bw_ov = mask_ov2640.astype(np.uint8) * 255
+            bw_ov = cv2.morphologyEx(bw_ov, cv2.MORPH_OPEN, k_open, iterations=1)
+            bw_ov = cv2.morphologyEx(bw_ov, cv2.MORPH_CLOSE, k_close, iterations=1)
+            bw_ov = imfill_holes(bw_ov)
+            mascaras_candidatas.append(bw_ov)
+
+        # Canal D: Rostros sobreexpuestos / alta iluminación (cuando el sensor OV2640 satura la piel a blanco Y>=195)
+        ycrcb_raw = cv2.cvtColor(small, cv2.COLOR_BGR2YCrCb)
+        Y_raw = ycrcb_raw[:, :, 0]
+        Cr_raw = ycrcb_raw[:, :, 1]
+        Cb_raw = ycrcb_raw[:, :, 2]
+        if float(np.mean(Y_raw >= 205)) >= 0.03:
+            mask_brillante = (
+                (Y_raw >= 195)
+                & (Cr_raw >= 120) & (Cr_raw <= 156)
+                & (Cb_raw >= 100) & (Cb_raw <= 136)
+                & no_rojo_cartel
+            )
+            bw_bri = mask_brillante.astype(np.uint8) * 255
+            bw_bri = cv2.morphologyEx(bw_bri, cv2.MORPH_OPEN, k_open, iterations=1)
+            bw_bri = cv2.morphologyEx(bw_bri, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1)
+            bw_bri = imfill_holes(bw_bri)
+            mascaras_candidatas.append(bw_bri)
+
+        area_min_s = 55  # ~16x16 en 320x240 -> detecta rostros incluso a 2.5 - 3 metros de distancia
+        area_max_s = int(w_s * h_s * 0.34)
+        sub_blobs = []
+
+        for bw_cand in mascaras_candidatas:
+            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(bw_cand, connectivity=8)
+            blobs_validos = []
+            for lbl in range(1, num_labels):
+                area = int(stats[lbl, cv2.CC_STAT_AREA])
+                if area < area_min_s or area > area_max_s:
+                    continue
+                bx = int(stats[lbl, cv2.CC_STAT_LEFT])
+                by = int(stats[lbl, cv2.CC_STAT_TOP])
+                bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+                bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+                if bw < 9 or bh < 11:
+                    continue
+                # Descartar puertas/paredes verticales de piso a techo o franjas horizontales de fondo
+                if bh > int(h_s * 0.86) or bw > int(w_s * 0.72):
+                    continue
+                # Descartar solapas de chaqueta / manos pequeñas pegadas al borde inferior del fotograma
+                cy_s = by + bh * 0.5
+                if cy_s > (h_s * 0.84) and bh < (h_s * 0.24):
+                    continue
+                # Priorizar blobs con proporción facial humana (0.50 <= bw/bh <= 1.45) antes que paredes/puertas
+                ar = float(bw) / float(max(1, bh))
+                es_prop_facial = (0.48 <= ar <= 1.48) and (by > 2 or bh < int(h_s * 0.65))
+                prioridad = (1 if es_prop_facial else 0, area)
+                blobs_validos.append((prioridad, [bx, by, bw, bh]))
+
+            blobs_validos.sort(key=lambda t: t[0], reverse=True)
+            for _, bb in blobs_validos[:6]:
+                sub_blobs.extend(dividir_blob_compuesto_pdi(bb, bw_cand))
+
+        variantes_blob = ((1.10, 0.48), (0.95, 0.49), (1.24, 0.47))
+        limite_prop = (max_candidatos - 4) if incluir_rejilla_respaldo else max_candidatos
+
+        for (sbx, sby, sbw, sbh) in sub_blobs[:12]:
+            fx = sbx * sx
+            fy = sby * sy
+            fw = sbw * sx
+            fh = sbh * sy
+
+            # Acotar altura facial efectiva para abarcar rostro completo alineado con el dataset 64x64
+            fh_eff = min(fh, fw * 1.38)
+            lado_base = max(fw * 1.24, fh_eff * 1.14)
+            lado_base = float(np.clip(lado_base, lado_min, lado_max))
+
+            cx_f = fx + fw * 0.50
+
+            # Anclajes anatómicos superiores: cuando la piel del rostro continúa hacia el cuello o ropa cálida (fh > fw),
+            # la cabeza humana real reside en la porción superior del blob.
+            if fh > fw * 1.05:
+                for sc_c, f_cy_c in ((1.16, 0.47), (1.06, 0.47), (0.96, 0.46)):
+                    lado_c = int(np.clip(round(fw * sc_c), lado_min, lado_max))
+                    lado_c = (lado_c // 2) * 2
+                    cy_c = fy + lado_c * f_cy_c
+                    qx_c = int(np.clip(round(cx_f - lado_c / 2.0), 0, max(0, W - lado_c)))
+                    qy_c = int(np.clip(round(cy_c - lado_c / 2.0), 0, max(0, H - lado_c)))
+                    _agregar_si_nueva([qx_c, qy_c, lado_c, lado_c], umbral_dup=0.86)
+
+            for sc, f_cy in variantes_blob:
+                cy_f = fy + fh_eff * f_cy
+                qlado = int(np.clip(round(lado_base * sc), lado_min, lado_max))
+                qlado = (qlado // 2) * 2
+                qx = int(np.clip(round(cx_f - qlado / 2.0), 0, max(0, W - qlado)))
+                qy = int(np.clip(round(cy_f - qlado / 2.0), 0, max(0, H - qlado)))
+                _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.86)
+                if len(propuestas) >= limite_prop:
+                    break
+            if len(propuestas) >= limite_prop:
+                break
+
+    # Rejilla ligera de respaldo multi-distancia (cerca, media y lejos) en zonas sin propuesta de piel
+    if incluir_rejilla_respaldo:
+        for factor_l, fracs_x, fracs_y in [
+            (0.44, [0.28, 0.50, 0.72], [0.46]),
+            (0.30, [0.24, 0.50, 0.76], [0.42]),
+            (0.19, [0.22, 0.50, 0.78], [0.38]),
+        ]:
+            qlado = (int(min_dim * factor_l) // 2) * 2
+            if qlado < lado_min or qlado > min_dim:
+                continue
+            for fx_r in fracs_x:
+                for fy_r in fracs_y:
+                    if len(propuestas) >= max_candidatos:
+                        break
+                    qx = int(np.clip(round(W * fx_r - qlado / 2.0), 0, max(0, W - qlado)))
+                    qy = int(np.clip(round(H * fy_r - qlado / 2.0), 0, max(0, H - qlado)))
+                    _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.35)
+
+    return propuestas[:max_candidatos]
 
 
 class ScalerPreservandoVarianza:
@@ -954,7 +1401,11 @@ class ScalerPreservandoVarianza:
         return self
 
     def transform(self, F_mat):
-        Z_scaled = F_mat[:, :self.n_pca] / self.scale_pca
+        Z_scaled = (F_mat[:, :self.n_pca] / self.scale_pca).copy()
+        # Atenuación espectral de las 2 primeras Eigenfaces de iluminación ambiental de sesión (Belhumeur et al., 1997)
+        if Z_scaled.shape[1] >= 2:
+            Z_scaled[:, 0] *= 0.18
+            Z_scaled[:, 1] *= 0.35
         if F_mat.shape[1] > self.n_pca:
             # Multiplicar por 0.12 para que las Eigenfaces PCA dominen la métrica de distancia
             extras_scaled = self.scaler_extras.transform(F_mat[:, self.n_pca:]) * 0.12
@@ -963,6 +1414,67 @@ class ScalerPreservandoVarianza:
 
     def fit_transform(self, F_mat):
         return self.fit(F_mat).transform(F_mat)
+
+
+class BottleneckConvolucional2D:
+    """
+    Pirámide Jerárquica de Segunda Etapa (MaxPool 2x2 y 4x4) + Recorte de ROI Elíptica
+    + Cuello de Botella Ortogonal (Convolutional Bottleneck) que preserva la relación
+    espectral lambda_m / lambda_1 de los mapas de activación 2D:
+      1. Elimina las celdas muertas en las esquinas exteriores de la máscara elíptica 16x16.
+      2. Construye dos niveles adicionales de invarianza espacial (MaxPool 8x8 y MaxPool 4x4).
+      3. Comprime las 1,888 activaciones jerárquicas a M=72 componentes convolucionales
+         ortogonales, reduciendo los parámetros de la cabecera densa de ~149,500 a ~19,000.
+    """
+    def __init__(self, n_components: int = 72, factor_energia: float = 0.55):
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        self.n_components = n_components
+        self.factor_energia = factor_energia
+        self.es_bottleneck = True
+        self.scaler_pyr = StandardScaler()
+        self.pca_conv = PCA(n_components=n_components, whiten=False, random_state=42)
+        self.scale_c1 = 1.0
+
+        yy, xx = np.mgrid[0:16, 0:16]
+        self.mask_roi_16 = (((xx - 7.5) / 6.2) ** 2 + ((yy - 7.5) / 7.2) ** 2) <= 1.0
+
+    def _construir_piramide_jerarquica(self, F_conv: np.ndarray) -> np.ndarray:
+        N = F_conv.shape[0]
+        maps_16 = F_conv[:, :2048].reshape(N, 8, 16, 16)
+        avg_8 = F_conv[:, 2048:]
+
+        # Nivel 1: Celdas activas dentro de la elipse facial (descarta esquinas muertas)
+        roi_16 = maps_16[:, :, self.mask_roi_16].reshape(N, -1)
+
+        # Nivel 2: Segundo Max-Pooling jerárquico 2x2 (16x16 -> 8x8)
+        pool2_max = maps_16.reshape(N, 8, 8, 2, 8, 2).max(axis=(3, 5)).reshape(N, -1)
+
+        # Nivel 3: Tercer Max-Pooling jerárquico 4x4 (16x16 -> 4x4, invarianza macro-espacial)
+        pool3_max = maps_16.reshape(N, 8, 4, 4, 4, 4).max(axis=(3, 5)).reshape(N, -1)
+
+        return np.hstack([roi_16, pool2_max, pool3_max, avg_8])
+
+    def fit(self, F_conv: np.ndarray):
+        pyr = self._construir_piramide_jerarquica(F_conv)
+        pyr_s = self.scaler_pyr.fit_transform(pyr)
+        C = self.pca_conv.fit_transform(pyr_s)
+        std_1 = float(np.std(C[:, 0]))
+        self.scale_c1 = std_1 if std_1 > 1e-6 else 1.0
+        return self
+
+    def transform(self, F_conv: np.ndarray) -> np.ndarray:
+        pyr = self._construir_piramide_jerarquica(F_conv)
+        pyr_s = self.scaler_pyr.transform(pyr)
+        C = self.pca_conv.transform(pyr_s)
+        C_scaled = (C / self.scale_c1) * self.factor_energia
+        if C_scaled.shape[1] >= 2:
+            # Atenuar modo de iluminación global en la primera componente convolucional
+            C_scaled[:, 0] *= 0.35
+        return C_scaled
+
+    def fit_transform(self, F_conv: np.ndarray) -> np.ndarray:
+        return self.fit(F_conv).transform(F_conv)
 
 
 

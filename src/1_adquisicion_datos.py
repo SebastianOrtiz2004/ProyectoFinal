@@ -10,14 +10,17 @@ import os
 import sys
 import glob
 import time
+import shutil
 import cv2
+import joblib
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Importar funciones canónicas de PDI
+# Importar funciones canónicas de PDI e IoT
 from utils_pdi import (
     descomponer_rgb_a_double,
     calcular_cuadrado_envolvente,
+    calcular_iou,
     imfill_holes,
     extraer_regionprops_basico,
     preprocesar_ventana_64x64,
@@ -25,9 +28,14 @@ from utils_pdi import (
     obtener_rejilla_ventanas_geometrica,
     analizar_morfologia_ventana_otsu,
     detectar_rostro_principal,
+    proponer_ventanas_rostros_pdi,
+    verificar_estructura_facial_pdi,
+    aplicar_nms_cajas,
+    calcular_nitidez_laplaciano,
     cv2_imread_unicode,
     cv2_imwrite_unicode,
 )
+from iot_esp32_telegram import cargar_config_iot, LectorCamaraThreaded
 
 CARPETAS_PERSONAS_DEFECTO = {
     0: ("id_0_sebastian", "Sebastián Ortiz"),
@@ -42,6 +50,7 @@ DIR_DATA = os.path.join(BASE_DIR, "data")
 DIR_FOTOS_CRUDAS = os.path.join(DIR_DATA, "fotos_crudas_celular")
 DIR_DATASET_64 = os.path.join(DIR_DATA, "dataset_procesado_64x64")
 DIR_CLASE_0 = os.path.join(DIR_DATASET_64, "clase_0_no_persona")
+DIR_MODELOS = os.path.join(BASE_DIR, "modelos_entrenados")
 DIR_FIGURAS = os.path.join(BASE_DIR, "figuras_y_reportes")
 
 
@@ -63,75 +72,205 @@ def asegurar_directorios():
         print(f"[LIMPIEZA] Eliminados {len(archivos_seed)} archivos sintéticos/seed de clase_0_no_persona.")
 
 
+def _archivar_fotos_sin_mascara_si_usuario_acepta(dir_carpeta: str, nombre_carpeta: str):
+    """
+    Detecta fotos antiguas SIN máscara elíptica (esquinas != 107) que degradan
+    la coherencia de encuadre entre identidades y ofrece archivarlas de forma segura
+    en data/backup_antiguas/ sin borrar nada permanentemente.
+    """
+    archivos = sorted(glob.glob(os.path.join(dir_carpeta, "*.png")))
+    if not archivos:
+        return
+    sin_mascara = []
+    for f in archivos:
+        im = cv2_imread_unicode(f, cv2.IMREAD_GRAYSCALE)
+        if im is None or im.shape != (64, 64):
+            continue
+        esquinas = [int(im[0, 0]), int(im[0, 63]), int(im[63, 0]), int(im[63, 63])]
+        if not all(abs(c - 107) <= 4 for c in esquinas):
+            sin_mascara.append(f)
+
+    if sin_mascara:
+        print(f"\n[AVISO CALIDAD DATASET] Se detectaron {len(sin_mascara)} fotos antiguas SIN máscara elíptica en '{nombre_carpeta}'.")
+        print("  Archivarlas evita confusiones entre personas y falsos positivos en objetos.")
+        resp = input("  ¿Desea mover esas fotos antiguas a 'data/backup_antiguas/' ahora? [s/N]: ").strip().lower()
+        if resp in ("s", "si", "sí", "y"):
+            dir_bkp = os.path.join(DIR_DATA, "backup_antiguas", nombre_carpeta)
+            os.makedirs(dir_bkp, exist_ok=True)
+            for f in sin_mascara:
+                try:
+                    shutil.move(f, os.path.join(dir_bkp, os.path.basename(f)))
+                except Exception:
+                    pass
+            print(f"  [OK] {len(sin_mascara)} fotos antiguas archivadas en: {dir_bkp}")
+
+
 def opcion_captura_webcam():
     """
-    Opción 1: Captura Interactiva con Cámara Web con Distribución por Ventanas en Vivo.
-    Guarda muestras de rostro (Clase 1 / id_X) y ventanas periféricas (Clase 0: No Persona).
+    Opción 1: Captura Interactiva con ESP32-CAM (IoT Wi-Fi) o Cámara Web Laptop.
+    Incluye Auto-Recorte Anatómico PDI unificado con el detector multi-rostro en vivo,
+    filtro de nitidez Laplaciana (para descartar fotos borrosas del OV2640) y vista previa 64x64.
     """
     asegurar_directorios()
+    cfg_iot = cargar_config_iot()
+    cfg_esp = cfg_iot["esp32"]
+
     print("\n" + "=" * 70)
-    print("OPCIÓN 1: CAPTURA INTERACTIVA CON CÁMARA WEB (DISTRIBUCIÓN POR VENTANAS)")
+    print("OPCIÓN 1: CAPTURA DE DATASET (ESP32-CAM IoT / CÁMARA WEB LAPTOP)")
     print("=" * 70)
-    print("Seleccione la persona a capturar:")
+    print("Seleccione la fuente de cámara:")
+    print("  [1] Cámara IoT ESP32-CAM por Wi-Fi (IP por defecto: 192.168.4.1)")
+    print("  [2] Cámara Web de la Laptop (índice 0)")
+    opc_cam = input("Fuente [1=ESP32-CAM, 2=Laptop, Enter=2]: ").strip()
+
+    usar_esp32 = (opc_cam == "1")
+    if usar_esp32:
+        ip_predeterminada = cfg_esp.get("ip", "192.168.100.77")
+        ip_in = input(f"IP del ESP32-CAM [Enter para usar {ip_predeterminada}]: ").strip()
+        ip_esp = ip_in if ip_in else ip_predeterminada
+        # Conexión directa al stream en WebServer.h (puerto 80 en '/')
+        url_stream = f"http://{ip_esp}/"
+        url_capture = None
+        fuente = url_stream
+        prefijo_cam = "esp32"
+        voltear_h = bool(cfg_esp.get("voltear_horizontal", False))
+        rotar_180 = bool(cfg_esp.get("rotar_180", False))
+        print(f"Conectando al ESP32-CAM en {url_stream} ...")
+    else:
+        fuente = 0
+        url_capture = None
+        prefijo_cam = "rostro"
+        voltear_h = True
+        rotar_180 = False
+
+    print("\nSeleccione la persona / clase a capturar:")
     for id_p, (carpeta, nombre) in CARPETAS_PERSONAS_DEFECTO.items():
         print(f"  [{id_p}] {nombre} ({carpeta})")
 
-    entrada_id = input("\nIngrese el ID de la persona [0 por defecto]: ").strip()
+    entrada_id = input("\nIngrese el ID [0 por defecto]: ").strip()
     id_sel = int(entrada_id) if entrada_id.isdigit() and int(entrada_id) in CARPETAS_PERSONAS_DEFECTO else 0
     carpeta_sel, nombre_sel = CARPETAS_PERSONAS_DEFECTO[id_sel]
     dir_destino_rostro = os.path.join(DIR_DATASET_64, carpeta_sel)
 
-    meta_muestras = 60
-    print(f"\nIniciando cámara para: {nombre_sel}")
-    print(f"Meta: {meta_muestras} muestras faciales.")
-    print("Controles:")
-    print("  - [ESPACIO]: Captura manual de muestra (rostro + 1 ventana de fondo)")
-    print("  - [A]: Alternar modo de captura continua automática (cada 0.45s con filtro de variación)")
-    print("  - [F]: Capturar directamente OBJETO / FONDO en la ventana central")
-    print("  - [Q / ESC]: Terminar captura y volver al menú principal\n")
+    if id_sel != 4:
+        _archivar_fotos_sin_mascara_si_usuario_acepta(dir_destino_rostro, carpeta_sel)
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] No se pudo abrir la cámara web (índice 0). Verifique su conexión.")
+    meta_nuevas = 350 if usar_esp32 else 250
+
+    # Iniciar lector de video en hilo de ultra-baja latencia (Zero-Buffer)
+    print(f"Abriendo stream de cámara ({'ESP32-CAM IoT' if usar_esp32 else 'Laptop'}): {fuente} ...")
+    lector = LectorCamaraThreaded(fuente=fuente, url_capture_respaldo=url_capture, rotar_180=rotar_180)
+    if not lector.iniciar():
+        print(f"[ERROR] No se pudo conectar a la cámara ({fuente}). Verifique conexión Wi-Fi / red.")
         return
 
     contador_rostros = len(glob.glob(os.path.join(dir_destino_rostro, "*.png")))
     contador_fondo = len(glob.glob(os.path.join(DIR_CLASE_0, "*.png")))
+    capturadas_sesion = 0
+
+    # Cargar clasificador supervisado de Etapa 1 para garantizar que el auto-recorte PDI
+    # encuadre exactamente el rostro humano y bloquee cuellos, capuchas o ropa cálida.
+    mod_e1_acq = None
+    pca_e1_acq = None
+    try:
+        p_pca = os.path.join(DIR_MODELOS, "etapa1_pca_humano.pkl")
+        p_mod = os.path.join(DIR_MODELOS, "etapa1_mejor_modelo.pkl")
+        if os.path.exists(p_pca) and os.path.exists(p_mod):
+            pca_e1_acq = joblib.load(p_pca)
+            mod_e1_acq = joblib.load(p_mod).get("info", None)
+            if mod_e1_acq:
+                print("[PDI] Validador biométrico de Etapa 1 cargado para auto-recorte anti-cuello.")
+    except Exception:
+        pass
+
     modo_auto = False
+    # Para rostros: Auto-Recorte PDI activado por defecto (idéntico al detector multi-rostro en vivo)
+    modo_auto_recorte = (id_sel != 4)
     ultimo_tiempo_auto = 0.0
     img_anterior_64 = None
+    UMBRAL_NITIDEZ_MIN = 15.0  # Filtra frames movidos/borrosos del ESP32-CAM
+
+    print(f"\nCámara iniciada ({'ESP32-CAM IoT' if usar_esp32 else 'Laptop'}) para: {nombre_sel}")
+    print(f"Meta sugerida en esta sesión: +{meta_nuevas} muestras nuevas (varía distancia: cerca, media, lejos y leves giros).")
+    print("Controles:")
+    print("  - [ESPACIO]: Captura manual inmediata")
+    print("  - [A]: Alternar ráfaga automática (cada 0.22s con filtro anti-borroso y anti-duplicado)")
+    print("  - [T]: Alternar encuadre: AUTO-SEGUIMIENTO PDI vs RECUADRO FIJO CENTRAL")
+    print("  - [F]: Capturar directamente OBJETO / CHAQUETA / FONDO en Clase 0")
+    print("  - [Q / ESC]: Terminar captura\n")
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Error al leer fotograma de la cámara.")
-            break
+        ret, frame = lector.leer()
+        if not ret or frame is None:
+            time.sleep(0.02)
+            continue
 
-        # Espejo horizontal para visualización natural del usuario
-        frame = cv2.flip(frame, 1)
+        if voltear_h:
+            frame = cv2.flip(frame, 1)
         H, W = frame.shape[:2]
         frame_vis = frame.copy()
 
-        # REJILLA MATEMÁTICA PURA (Sin clasificadores preentrenados)
-        # Ventana Central Anatómica (factor_central=0.38, ~180x180 px en 640x480)
-        cuadrado_rostro, esquinas_fondo = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.38)
-        qx, qy, qlado, _ = cuadrado_rostro
+        cuadrado_fijo, esquinas_fondo = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.38)
+        caja_activa = cuadrado_fijo
+        rostro_pdi_valido = (id_sel == 4)
 
-        # Análisis morfológico puro con Binarización de Otsu + imfill + regionprops
-        parche_central = frame[qy : qy + qlado, qx : qx + qlado]
-        info_morf = analizar_morfologia_ventana_otsu(parche_central)
+        if modo_auto_recorte and id_sel != 4:
+            # Usar el MISMO generador multi-rostro PDI + supresión anatómica de cuello que en 3_reconocimiento_en_vivo.py
+            propuestas = proponer_ventanas_rostros_pdi(frame, max_candidatos=16, incluir_rejilla_respaldo=False)
+            cajas_ok_pdi = []
+            scores_ok_pdi = []
+            for cand in propuestas:
+                cx_c, cy_c, cl_c, _ = cand
+                parche_c = frame[cy_c : cy_c + cl_c, cx_c : cx_c + cl_c]
+                if parche_c.shape[0] < 48 or parche_c.shape[1] < 48:
+                    continue
+                im_c, vec_c = preprocesar_ventana_64x64(parche_c)
+                ok_pdi, met_pdi = verificar_estructura_facial_pdi(parche_c, im_c)
+                if ok_pdi:
+                    prob_humano = 0.50
+                    if mod_e1_acq is not None and pca_e1_acq is not None:
+                        try:
+                            f_raw = pca_e1_acq.transform(vec_c.reshape(1, -1))
+                            sc_e1 = mod_e1_acq.get("scaler", None)
+                            f_in = sc_e1.transform(f_raw) if sc_e1 is not None else f_raw
+                            mod_obj = mod_e1_acq["modelo"]
+                            if hasattr(mod_obj, "predict_proba"):
+                                prob_humano = float(mod_obj.predict_proba(f_in)[0, 1])
+                            else:
+                                prob_humano = 0.85 if int(mod_obj.predict(f_in)[0]) == 1 else 0.15
+                        except Exception:
+                            prob_humano = 0.50
 
-        # Centroide geométrico continuo y caja ajustada dentro de la ventana
-        cx_local, cy_local = info_morf["centroide_local"]
-        cx_global = int(qx + cx_local)
-        cy_global = int(qy + cy_local)
+                    if prob_humano < 0.50:
+                        continue  # Rechazar cuellos, capuchas o pliegues de ropa
 
-        # Dibujar ventana central simétrica (Verde para rostro, Naranja para Objetos)
-        color_caja = (0, 165, 255) if id_sel == 4 else (0, 255, 0)
+                    dist_centro = np.hypot((cx_c + cl_c * 0.5) - W * 0.5, (cy_c + cl_c * 0.45) - H * 0.42) / float(W)
+                    score = 2.0 * prob_humano + float(met_pdi.get("sim_bilateral", 0.0)) - 0.8 * dist_centro
+                    cajas_ok_pdi.append(cand)
+                    scores_ok_pdi.append(score)
+            idx_nms = aplicar_nms_cajas(cajas_ok_pdi, scores_ok_pdi, umbral_iou=0.25, umbral_contencion=0.45)
+            if idx_nms:
+                caja_activa = cajas_ok_pdi[idx_nms[0]]
+                rostro_pdi_valido = True
+        else:
+            rostro_pdi_valido = True
+
+        qx, qy, qlado, _ = caja_activa
+        parche_activo = frame[qy : qy + qlado, qx : qx + qlado]
+        nitidez = calcular_nitidez_laplaciano(parche_activo)
+        es_nitido = nitidez >= UMBRAL_NITIDEZ_MIN
+
+        # Vista previa exacta de la matriz 64x64 preprocesada (esquina superior derecha)
+        img_preview_64, _ = preprocesar_ventana_64x64(parche_activo)
+        prev_u8 = np.clip(img_preview_64 * 255.0, 0, 255).astype(np.uint8)
+        prev_bgr = cv2.cvtColor(cv2.resize(prev_u8, (96, 96), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+        if W >= 120 and H >= 120:
+            frame_vis[8:104, W - 104 : W - 8] = prev_bgr
+            cv2.rectangle(frame_vis, (W - 105, 7), (W - 7, 105), (0, 255, 200), 1)
+            cv2.putText(frame_vis, "Entrada 64x64", (W - 104, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 200), 1)
+
+        color_caja = (0, 165, 255) if id_sel == 4 else ((0, 255, 0) if (rostro_pdi_valido and es_nitido) else (0, 200, 255))
         cv2.rectangle(frame_vis, (qx, qy), (qx + qlado, qy + qlado), color_caja, 2)
-        cv2.circle(frame_vis, (cx_global, cy_global), 4, color_caja, -1)
-
-        # Elipse anatómica guía punteada en el centro de la caja
         cv2.ellipse(
             frame_vis,
             (qx + qlado // 2, qy + qlado // 2),
@@ -144,68 +283,43 @@ def opcion_captura_webcam():
             cv2.LINE_AA,
         )
 
-        # Guías visuales de alineación de cátedra
+        modo_txt = "AUTO-PDI" if (modo_auto_recorte and id_sel != 4) else "FIJO"
+        estado_nit = f"Nitidez:{nitidez:.0f} ({'OK' if es_nitido else 'BORROSA'})"
         etiqueta_caja = (
-            f"OBJETO / NO-PERSONA: Botellas, celulares, manos [{qlado}x{qlado}]"
+            f"OBJETO/CLASE 0 [{qlado}x{qlado}]"
             if id_sel == 4
-            else f"Ventana Facial: {nombre_sel} [{qlado}x{qlado}]"
+            else f"{modo_txt}: {qlado}x{qlado} | {estado_nit}"
         )
+        cv2.putText(frame_vis, etiqueta_caja, (qx, max(20, qy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color_caja, 1, cv2.LINE_AA)
+
+        # Filtrar esquinas de fondo con IoU == 0 respecto a la caja activa
+        esquinas_validas = [e for e in esquinas_fondo if calcular_iou(e, caja_activa) == 0.0]
+        for vx, vy, vw, vh in esquinas_validas:
+            cv2.rectangle(frame_vis, (vx, vy), (vx + vw, vy + vh), (255, 120, 0), 1)
+
+        # Panel inferior
+        cv2.rectangle(frame_vis, (8, H - 72), (W - 8, H - 8), (20, 20, 20), -1)
         cv2.putText(
             frame_vis,
-            etiqueta_caja,
-            (qx, max(20, qy - 10)),
+            f"Cam: {'ESP32-CAM' if usar_esp32 else 'Laptop'} | {nombre_sel[:18]} | Sesion: +{capturadas_sesion}/{meta_nuevas} (Total:{contador_rostros}) | C0:{contador_fondo}",
+            (14, H - 48),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            color_caja,
-            2,
-        )
-        freeman_preview = "".join(str(c) for c in info_morf["freeman_sample"][:8])
-        cv2.putText(
-            frame_vis,
-            f"Centroide: ({cx_global}, {cy_global}) | Otsu Area: {info_morf['area']:.0f}px | Freeman8: {freeman_preview}",
-            (qx, qy + qlado + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (0, 230, 255),
+            0.44,
+            (255, 255, 255),
             1,
         )
-
-        # Dibujar las 4 ventanas periféricas de fondo (Clase 0)
-        for vx, vy, vw, vh in esquinas_fondo:
-            cv2.rectangle(frame_vis, (vx, vy), (vx + vw, vy + vh), (255, 120, 0), 1)
-            cv2.putText(
-                frame_vis,
-                "Fondo",
-                (vx + 4, vy + 16),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.36,
-                (255, 140, 0),
-                1,
-            )
-
-        # Panel de estado en pantalla
-        cv2.rectangle(frame_vis, (10, H - 75), (W - 10, H - 10), (20, 20, 20), -1)
+        estado_auto = "AUTO ON" if modo_auto else "AUTO OFF [A]"
         cv2.putText(
             frame_vis,
-            f"Persona: {nombre_sel} | Rostros: {contador_rostros}/{meta_muestras} | Fondo: {contador_fondo}",
-            (20, H - 50),
+            f"{estado_auto} | [ESP]=Foto | [T]=Modo({modo_txt}) | [F]=Objeto | [Q]=Salir",
+            (14, H - 22),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-        )
-        estado_auto = "ACTIVADO (0.45s)" if modo_auto else "DESACTIVADO [Presione 'A']"
-        cv2.putText(
-            frame_vis,
-            f"Modo Auto: {estado_auto} | [ESPACIO]=Capturar | [A]=Auto | [F]=Objeto | [Q]=Salir",
-            (20, H - 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.42,
             (0, 220, 255),
             1,
         )
 
-        cv2.imshow("Adquisicion Hibrida PDI - Distribucion por Ventanas", frame_vis)
+        cv2.imshow("Adquisicion PDI (ESP32-CAM / Webcam) - FISEI UTA", frame_vis)
         tecla = cv2.waitKey(1) & 0xFF
 
         capturar_ahora = False
@@ -216,104 +330,118 @@ def opcion_captura_webcam():
             capturar_ahora = True
         elif tecla in [ord("a"), ord("A")]:
             modo_auto = not modo_auto
-            print(f"[MODO AUTO] {'Activado' if modo_auto else 'Desactivado'}")
+            print(f"\n[MODO AUTO] {'Activado' if modo_auto else 'Desactivado'}")
+        elif tecla in [ord("t"), ord("T")] and id_sel != 4:
+            modo_auto_recorte = not modo_auto_recorte
+            print(f"\n[ENCUADRE] Cambiado a: {'AUTO-SEGUIMIENTO PDI' if modo_auto_recorte else 'RECUADRO FIJO CENTRAL'}")
         elif tecla in [ord("f"), ord("F")]:
-            # Captura inmediata de objeto/fondo central
-            if parche_central.shape[0] >= 32 and parche_central.shape[1] >= 32:
-                img_f_64, _ = preprocesar_ventana_64x64(parche_central)
+            if parche_activo.shape[0] >= 32 and parche_activo.shape[1] >= 32:
+                img_f_64, _ = preprocesar_ventana_64x64(parche_activo)
                 img_save_f = np.clip(img_f_64 * 255.0, 0, 255).astype(np.uint8)
-                ruta_f = os.path.join(DIR_CLASE_0, f"objeto_manual_{contador_fondo:05d}.png")
+                ruta_f = os.path.join(DIR_CLASE_0, f"objeto_{prefijo_cam}_{contador_fondo:05d}.png")
                 cv2_imwrite_unicode(ruta_f, img_save_f)
                 contador_fondo += 1
-                print(f"\r-> [TECLA F] Objeto/Fondo manual guardado: #{contador_fondo:04d}", end="")
+                print(f"\r-> [TECLA F] Objeto/Fondo guardado ({prefijo_cam}): #{contador_fondo:04d}", end="")
 
-        if modo_auto and (time.time() - ultimo_tiempo_auto >= 0.45):
+        if modo_auto and (time.time() - ultimo_tiempo_auto >= 0.22):
             capturar_ahora = True
             ultimo_tiempo_auto = time.time()
 
-        if capturar_ahora and (parche_central.shape[0] >= 32 and parche_central.shape[1] >= 32):
+        if capturar_ahora and (parche_activo.shape[0] >= 32 and parche_activo.shape[1] >= 32):
             if id_sel == 4:
-                # Captura de Objeto / Fondo para enriquecer Clase 0
-                img_obj_64, _ = preprocesar_ventana_64x64(parche_central)
+                img_obj_64, _ = preprocesar_ventana_64x64(parche_activo)
                 img_save_obj = np.clip(img_obj_64 * 255.0, 0, 255).astype(np.uint8)
-                ruta_obj = os.path.join(DIR_CLASE_0, f"objeto_central_{contador_fondo:05d}.png")
+                ruta_obj = os.path.join(DIR_CLASE_0, f"objeto_{prefijo_cam}_{contador_fondo:05d}.png")
                 cv2_imwrite_unicode(ruta_obj, img_save_obj)
                 contador_fondo += 1
-                print(
-                    f"\r-> Guardada muestra de OBJETOS/FONDO Clase 0: #{contador_fondo:04d}",
-                    end="",
-                )
+                capturadas_sesion += 1
+                print(f"\r-> Guardada muestra Clase 0 ({prefijo_cam}): #{contador_fondo:04d}", end="")
             else:
-                # Preprocesar rostro central con PDI completo de cátedra
-                img_rostro_64, _ = preprocesar_ventana_64x64(parche_central)
+                if modo_auto and ((not rostro_pdi_valido) or (not es_nitido)):
+                    continue  # Saltar frame sin rostro claro o movido
 
-                # Control anti-leakage: verificar que haya movimiento respecto al fotograma anterior
+                img_rostro_64 = img_preview_64
                 if img_anterior_64 is not None and modo_auto:
                     dif_img = float(np.mean(np.abs(img_rostro_64 - img_anterior_64)))
-                    if dif_img < 0.020:
-                        continue  # Fotograma estático/idéntico; esperar a que el usuario se mueva
+                    if dif_img < 0.018:
+                        continue  # Esperar ligera variación de pose/posición
 
                 img_anterior_64 = img_rostro_64.copy()
                 img_save_rostro = np.clip(img_rostro_64 * 255.0, 0, 255).astype(np.uint8)
-                ruta_rostro = os.path.join(
-                    dir_destino_rostro, f"rostro_{contador_rostros:04d}.png"
-                )
+                ts_ms = int(time.time() * 1000) % 100000
+                ruta_rostro = os.path.join(dir_destino_rostro, f"{prefijo_cam}_{contador_rostros:04d}_{ts_ms}.png")
                 cv2_imwrite_unicode(ruta_rostro, img_save_rostro)
                 contador_rostros += 1
+                capturadas_sesion += 1
 
-                # Guardar como máximo 1 ventana de fondo por foto de rostro (alternando esquinas)
-                if len(esquinas_fondo) > 0:
-                    vx, vy, vw, vh = esquinas_fondo[contador_rostros % len(esquinas_fondo)]
+                # Guardar 1 ventana de fondo (IoU == 0) cada 2 fotos faciales para nutrir Clase 0 del mismo sensor
+                if esquinas_validas and (capturadas_sesion % 2 == 0):
+                    vx, vy, vw, vh = esquinas_validas[contador_rostros % len(esquinas_validas)]
                     parche_esq = frame[vy : vy + vh, vx : vx + vw]
                     if parche_esq.shape[0] >= 16 and parche_esq.shape[1] >= 16:
                         img_fondo_64, _ = preprocesar_ventana_64x64(parche_esq)
                         img_save_fondo = np.clip(img_fondo_64 * 255.0, 0, 255).astype(np.uint8)
-                        ruta_fondo = os.path.join(
-                            DIR_CLASE_0, f"fondo_auto_{contador_fondo:05d}.png"
-                        )
+                        ruta_fondo = os.path.join(DIR_CLASE_0, f"fondo_{prefijo_cam}_{contador_fondo:05d}.png")
                         cv2_imwrite_unicode(ruta_fondo, img_save_fondo)
                         contador_fondo += 1
 
                 print(
-                    f"\r-> Guardada muestra facial #{contador_rostros:03d} | Ventanas fondo Clase 0: #{contador_fondo:04d}",
+                    f"\r-> Guardada +{capturadas_sesion:03d} ({prefijo_cam}, nitidez={nitidez:.0f}) | Total {carpeta_sel}: {contador_rostros} | C0: {contador_fondo}",
                     end="",
                 )
 
-            if id_sel != 4 and contador_rostros >= meta_muestras and modo_auto:
-                print(f"\n[OK] Se ha alcanzado la meta de {meta_muestras} muestras.")
-                modo_auto = False
+            if id_sel != 4 and capturadas_sesion >= meta_nuevas and modo_auto:
+                print(f"\n[OK] Se alcanzó la meta de +{meta_nuevas} muestras nuevas en esta sesión.")
                 modo_auto = False
 
-    cap.release()
+    if lector is not None:
+        lector.liberar()
     cv2.destroyAllWindows()
-    print(f"\nResumen: {contador_rostros} rostros en '{carpeta_sel}' y {contador_fondo} fondos en 'clase_0_no_persona'.\n")
+    print(f"\nResumen: +{capturadas_sesion} nuevas (total {contador_rostros} en '{carpeta_sel}', {contador_fondo} en 'clase_0_no_persona').\n")
 
 
-def opcion_procesar_fotos_celular():
+def opcion_procesar_fotos_cruda_lotes():
     """
-    Opción 2: Procesa fotografías tomadas con el teléfono celular colocadas en data/fotos_crudas_celular/
-    Aplica el algoritmo del cuadrado envolvente, extrae el rostro a 64x64 y 3 ventanas de fondo.
+    Opción 2: Procesa por lotes las fotografías crudas tomadas con el ESP32-CAM o celular
+    guardadas en data/id_0_sebastian, data/id_1_angel, etc.
+    Aplica el algoritmo del cuadrado envolvente, PDI de cátedra (mediana, Gauss, Otsu, ecualización),
+    extrae el rostro normalizado a 64x64 y 3 ventanas de fondo para clase_0_no_persona.
     """
     asegurar_directorios()
     print("\n" + "=" * 70)
-    print("OPCIÓN 2: INGESTA Y PROCESAMIENTO POR LOTES DE FOTOS DEL CELULAR")
+    print("OPCIÓN 2: INGESTA Y PROCESAMIENTO PDI POR LOTES (ESP32-CAM / CRUDAS)")
     print("=" * 70)
 
     total_rostros_proc = 0
     total_fondos_proc = len(glob.glob(os.path.join(DIR_CLASE_0, "*.png")))
 
     for id_p, (carpeta, nombre) in CARPETAS_PERSONAS_DEFECTO.items():
-        dir_cruda = os.path.join(DIR_FOTOS_CRUDAS, carpeta)
-        dir_salida = os.path.join(DIR_DATASET_64, carpeta)
+        if id_p == 4:
+            continue  # Clase 0 es solo de fondo
 
-        patrones = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
+        # Buscar imágenes tanto en data/id_X como en data/fotos_crudas_celular/id_X
+        posibles_dirs = [
+            os.path.join(DIR_DATA, carpeta),
+            os.path.join(DIR_FOTOS_CRUDAS, carpeta),
+        ]
+
         archivos = []
-        for pat in patrones:
-            archivos.extend(glob.glob(os.path.join(dir_cruda, pat)))
+        dir_cruda_encontrada = ""
+        patrones = ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"]
+        for d in posibles_dirs:
+            if os.path.exists(d):
+                for pat in patrones:
+                    encontrados = glob.glob(os.path.join(d, pat))
+                    if encontrados:
+                        archivos.extend(encontrados)
+                        dir_cruda_encontrada = d
+
+        dir_salida = os.path.join(DIR_DATASET_64, carpeta)
+        os.makedirs(dir_salida, exist_ok=True)
 
         print(f"\nRevisando {carpeta} ({nombre}): {len(archivos)} imágenes crudas encontradas.")
         if not archivos:
-            print(f"  [AVISO] No hay imágenes en '{dir_cruda}'. Copie aquí fotos tomadas con su celular.")
+            print(f"  [AVISO] No hay imágenes crudas para {nombre}.")
             continue
 
         procesadas_sujeto = 0
@@ -323,8 +451,10 @@ def opcion_procesar_fotos_celular():
                 continue
 
             H, W = frame.shape[:2]
-            # En fotos del celular: Usar rejilla geométrica central o recorte proporcional
-            cuadrado_rostro, esquinas_fondo = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.55)
+            # Localización Anatómica Facial Canónica
+            cuadrado_rostro = detectar_rostro_principal(frame, factor_central=0.48)
+            ventanas_fondo = extraer_ventanas_negativas_esquinas(frame, cuadrado_rostro, num_ventanas=3)
+
             qx, qy, qlado, _ = cuadrado_rostro
             parche_rostro = frame[qy : qy + qlado, qx : qx + qlado]
 
@@ -332,24 +462,21 @@ def opcion_procesar_fotos_celular():
                 img_rostro_64, _ = preprocesar_ventana_64x64(parche_rostro)
                 img_save = np.clip(img_rostro_64 * 255.0, 0, 255).astype(np.uint8)
                 nombre_base = os.path.splitext(os.path.basename(ruta_img))[0]
-                ruta_guardar = os.path.join(dir_salida, f"cel_{nombre_base}_{procesadas_sujeto:03d}.png")
+                ruta_guardar = os.path.join(dir_salida, f"proc_{nombre_base}.png")
                 cv2_imwrite_unicode(ruta_guardar, img_save)
                 procesadas_sujeto += 1
                 total_rostros_proc += 1
 
-                # Ventanas negativas de fondo
-                for vx, vy, vw, vh in esquinas_fondo:
-                    parche_esq = frame[vy : vy + vh, vx : vx + vw]
-                    if parche_esq.shape[0] >= 16 and parche_esq.shape[1] >= 16:
-                        img_f_64, _ = preprocesar_ventana_64x64(parche_esq)
-                        img_f_save = np.clip(img_f_64 * 255.0, 0, 255).astype(np.uint8)
-                        ruta_f = os.path.join(DIR_CLASE_0, f"fondo_cel_{total_fondos_proc:05d}.png")
-                        cv2_imwrite_unicode(ruta_f, img_f_save)
-                        total_fondos_proc += 1
+                # Ventanas negativas de fondo calculadas por extraer_ventanas_negativas_esquinas
+                for img_f_64, _, _ in ventanas_fondo:
+                    img_f_save = np.clip(img_f_64 * 255.0, 0, 255).astype(np.uint8)
+                    ruta_f = os.path.join(DIR_CLASE_0, f"fondo_auto_{total_fondos_proc:05d}.png")
+                    cv2_imwrite_unicode(ruta_f, img_f_save)
+                    total_fondos_proc += 1
 
-        print(f"  -> {procesadas_sujeto} rostros extraídos y guardados en '{dir_salida}'.")
+        print(f"  -> {procesadas_sujeto} rostros preprocesados PDI a 64x64 guardados en '{dir_salida}'.")
 
-    print(f"\n[OK] Proceso por lotes finalizado. Total rostros nuevos: {total_rostros_proc}. Total fondos: {total_fondos_proc}\n")
+    print(f"\n[OK] Proceso por lotes finalizado. Total rostros: {total_rostros_proc}. Total fondos: {total_fondos_proc}\n")
 
 
 def opcion_generar_figura1_diagnostico():
@@ -527,7 +654,7 @@ def menu_principal():
         print("Autores: Sebastián Ortiz (ID 0) & Ángel Ayuquina (ID 1)")
         print("=" * 70)
         print("  1. Captura interactiva con cámara web (Distribución por Ventanas en vivo)")
-        print("  2. Procesar fotografías del celular por lotes (fotos_crudas_celular/)")
+        print("  2. Procesar fotografías crudas por lotes (ESP32-CAM / data/id_X/)")
         print("  3. Generar Figura 1 diagnóstica de PDI (figura1_pipeline_pdi_completo.png)")
         print("  4. Salir")
         print("=" * 70)
@@ -536,7 +663,7 @@ def menu_principal():
         if opc == "1":
             opcion_captura_webcam()
         elif opc == "2":
-            opcion_procesar_fotos_celular()
+            opcion_procesar_fotos_cruda_lotes()
         elif opc == "3":
             opcion_generar_figura1_diagnostico()
         elif opc == "4":
