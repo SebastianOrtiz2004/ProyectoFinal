@@ -400,10 +400,10 @@ class NotificadorTelegram:
         except Exception:
             pass
 
-    def notificar_ingreso_autorizado(self, frame_bgr: np.ndarray, total_rostros: int, num_autorizados: int, nombres_aut: list):
+    def notificar_ingreso_autorizado(self, frame_bgr: np.ndarray, total_rostros: int, num_autorizados: int, nombres_aut: list) -> bool:
         ahora = time.time()
         if (ahora - self._ultimo_envio_aut) < self.cooldown_autorizado:
-            return
+            return False
         self._ultimo_envio_aut = ahora
 
         fecha_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -411,17 +411,19 @@ class NotificadorTelegram:
         self._registrar_bitacora("ACCESO_AUTORIZADO", total_rostros, num_autorizados, total_rostros - num_autorizados, detalle)
 
         if not self.habilitado:
-            return
+            return False
 
         mensaje = (
             f"ACCESO AUTORIZADO\n"
+            f"Persona: {detalle} ha accedido.\n"
             f"Lugar: {self.nombre_lugar}\n"
             f"Fecha y hora: {fecha_str}\n"
             f"Rostros en camara: {total_rostros} (Autorizados: {num_autorizados})\n"
-            f"Estado: Ingreso permitido por el sistema biometrico IoT."
+            f"Estado: Ingreso confirmado por verificacion biometrica IoT."
         )
         frame_copia = frame_bgr.copy() if frame_bgr is not None else None
         threading.Thread(target=self._enviar_telegram, args=(mensaje, frame_copia), daemon=True).start()
+        return True
 
     def notificar_alerta_desconocido(self, frame_bgr: np.ndarray, total_rostros: int, num_desconocidos: int):
         if not self.enviar_alerta_desconocido:

@@ -997,6 +997,15 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     if gy_boca < 0.011 or (float(np.percentile(zona_boca, 90)) - float(np.percentile(zona_boca, 10))) < 0.055:
         return False, {"motivo_rechazo": "Sin nariz ni labios (Puno/Mano/Pared)", "sim_bilateral": mejor_sim_norm}
 
+    # 6b. Bloquear estructuras de franjas estrictamente horizontales (dedos apilados / persianas):
+    # En rostros reales el puente nasal, ojos y comisuras generan bordes verticales relevantes (gy/gx <= 2.15),
+    # mientras dedos horizontales apilados presentan anisotropía horizontal extrema (gy/gx >= 2.35).
+    nuc_grad = gris_rel[16:50, 14:50]
+    gy_nuc = float(np.mean(np.abs(cv2.Sobel(nuc_grad, cv2.CV_64F, 0, 1, ksize=3))))
+    gx_nuc = float(np.mean(np.abs(cv2.Sobel(nuc_grad, cv2.CV_64F, 1, 0, ksize=3))))
+    if gy_nuc > 2.30 * (gx_nuc + 1e-6):
+        return False, {"motivo_rechazo": "Patron de franjas horizontales (Dedos/Mano)", "sim_bilateral": mejor_sim_norm}
+
     # 7. Crominancia de piel humana en la región central (invariante a baja luz Y sobreexposición OV2640):
     R_n = np.clip(R_nuc * gain_loc, 0, 1)
     G_n = np.clip((G_nuc - bias_ov2640_g) * gain_loc, 0, 1)
@@ -1025,6 +1034,24 @@ def verificar_estructura_facial_pdi(parche_bgr: np.ndarray, img_64_double: np.nd
     )
     if piel_centro < 0.48 or piel_superior < 0.44 or piel_core < 0.62 or q_min_piel < 0.45:
         return False, {"motivo_rechazo": "Sin continuidad facial en 4 cuadrantes (Mano/Objeto/Cuaderno)", "sim_bilateral": mejor_sim_norm}
+
+    # 7b. Bloquear estructuras acromáticas/grises puras (lámparas fluorescentes, ventanas, techos, marcos)
+    # y focos quemados en blanco puro (>38% del núcleo en saturación blanca absoluta >0.92).
+    pct_quemado_blanco = float(np.mean((gris_nuc > 0.92) & (np.abs(R_nuc - B_nuc) < 0.04)))
+    if pct_quemado_blanco > 0.38:
+        return False, {"motivo_rechazo": "Fuente de luz / Ventana / Lampara blanca", "sim_bilateral": mejor_sim_norm}
+    p75_gris_nuc = float(np.percentile(gris_nuc, 75))
+    if p75_gris_nuc < 0.90:
+        calidez_rb = float(np.percentile(R_nuc - B_nuc, 75))
+        calidez_rg = float(np.percentile(R_nuc - G_nuc, 75))
+        if calidez_rb < 0.016 and calidez_rg < 0.014:
+            return False, {"motivo_rechazo": "Superficie acromatica gris/techo/lampara", "sim_bilateral": mejor_sim_norm}
+
+    # 7c. En recortes muy pequeños (< 86 px), exigir un mínimo de relieve/contraste y ausencia de
+    # zonas negras sólidas de puerta/mueble en >30% de la caja para no confundir bisagras o bordes de madera.
+    if parche_bgr.shape[0] < 86:
+        if float(np.mean(gris_nuc_rel < 0.22)) > 0.28:
+            return False, {"motivo_rechazo": "Borde oscuro de mueble/madera pequeno", "sim_bilateral": mejor_sim_norm}
 
     return True, {"sim_bilateral": mejor_sim_norm, "motivo_rechazo": ""}
 
@@ -1233,6 +1260,23 @@ def proponer_ventanas_rostros_pdi(
 
         mascaras_candidatas = [bw_piel]
 
+        # Canal A2 (Separación de pared beige/madera): si bw_piel se fundió con un fondo claro/cálido
+        # (>22% del fotograma), agregar una máscara de crominancia facial más selectiva (Cr - Cb >= 10)
+        # que separa los rostros humanos reales sin que el fondo los absorba en un solo blob gigante.
+        if float(np.mean(bw_piel > 0)) > 0.22:
+            diff_cr_cb = Cr.astype(np.int16) - Cb.astype(np.int16)
+            m_sep = (
+                (Y_c >= 24) & (Y_c <= 248)
+                & (Cr >= 131) & (Cr <= 175)
+                & (Cb >= 76) & (Cb <= 125)
+                & (diff_cr_cb >= 10)
+                & no_rojo_cartel
+            ).astype(np.uint8) * 255
+            m_sep = cv2.morphologyEx(m_sep, cv2.MORPH_OPEN, k_open, iterations=1)
+            m_sep = cv2.morphologyEx(m_sep, cv2.MORPH_CLOSE, k_close, iterations=1)
+            m_sep = imfill_holes(m_sep)
+            mascaras_candidatas.append(m_sep)
+
         # Canal B2 (Baja iluminación extrema, p95 < 0.35): YCrCb sobre imagen amplificada como canal adicional
         if p95 < 0.35:
             small_low = np.clip(small.astype(np.float32) * gain, 0, 255).astype(np.uint8)
@@ -1320,10 +1364,24 @@ def proponer_ventanas_rostros_pdi(
             for _, bb in blobs_validos[:6]:
                 sub_blobs.extend(dividir_blob_compuesto_pdi(bb, bw_cand))
 
-        variantes_blob = ((1.10, 0.48), (0.95, 0.49), (1.24, 0.47))
-        limite_prop = (max_candidatos - 4) if incluir_rejilla_respaldo else max_candidatos
+        # Descartar paredes/fondos pegados al borde superior (by <= 2) antes de priorizar caras reales:
+        # un rostro humano real tiene cabello/techo arriba y está flotando en la escena (by > 2).
+        sub_blobs.sort(
+            key=lambda b: (
+                1 if (b[1] > 4 and b[2] >= 22 and b[3] >= 24 and 0.45 <= (float(b[2]) / max(1.0, float(b[3]))) <= 1.65) else 0,
+                1 if (b[1] > 2) else 0,
+                b[2] * b[3],
+            ),
+            reverse=True,
+        )
 
-        for (sbx, sby, sbw, sbh) in sub_blobs[:12]:
+        # Generar máximo 2 escalas por blob (en vez de 6) para garantizar que TODOS los blobs de
+        # distintas personas (1, 2, 3 o 4 rostros en escena) alcancen a entrar dentro de limite_prop
+        # en lugar de que 1 o 2 blobs gigantes de fondo consuman todo el cupo.
+        variantes_blob = ((1.08, 0.48), (0.92, 0.49))
+        limite_prop = (max_candidatos - 10) if incluir_rejilla_respaldo else max_candidatos
+
+        for (sbx, sby, sbw, sbh) in sub_blobs[:16]:
             fx = sbx * sx
             fy = sby * sy
             fw = sbw * sx
@@ -1336,16 +1394,14 @@ def proponer_ventanas_rostros_pdi(
 
             cx_f = fx + fw * 0.50
 
-            # Anclajes anatómicos superiores: cuando la piel del rostro continúa hacia el cuello o ropa cálida (fh > fw),
-            # la cabeza humana real reside en la porción superior del blob.
-            if fh > fw * 1.05:
-                for sc_c, f_cy_c in ((1.16, 0.47), (1.06, 0.47), (0.96, 0.46)):
-                    lado_c = int(np.clip(round(fw * sc_c), lado_min, lado_max))
-                    lado_c = (lado_c // 2) * 2
-                    cy_c = fy + lado_c * f_cy_c
-                    qx_c = int(np.clip(round(cx_f - lado_c / 2.0), 0, max(0, W - lado_c)))
-                    qy_c = int(np.clip(round(cy_c - lado_c / 2.0), 0, max(0, H - lado_c)))
-                    _agregar_si_nueva([qx_c, qy_c, lado_c, lado_c], umbral_dup=0.86)
+            # Anclaje anatómico superior (1 escala): cuando la piel continúa al cuello/camiseta (fh > fw)
+            if fh > fw * 1.10:
+                lado_c = int(np.clip(round(fw * 1.08), lado_min, lado_max))
+                lado_c = (lado_c // 2) * 2
+                cy_c = fy + lado_c * 0.47
+                qx_c = int(np.clip(round(cx_f - lado_c / 2.0), 0, max(0, W - lado_c)))
+                qy_c = int(np.clip(round(cy_c - lado_c / 2.0), 0, max(0, H - lado_c)))
+                _agregar_si_nueva([qx_c, qy_c, lado_c, lado_c], umbral_dup=0.72)
 
             for sc, f_cy in variantes_blob:
                 cy_f = fy + fh_eff * f_cy
@@ -1353,7 +1409,7 @@ def proponer_ventanas_rostros_pdi(
                 qlado = (qlado // 2) * 2
                 qx = int(np.clip(round(cx_f - qlado / 2.0), 0, max(0, W - qlado)))
                 qy = int(np.clip(round(cy_f - qlado / 2.0), 0, max(0, H - qlado)))
-                _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.86)
+                _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.72)
                 if len(propuestas) >= limite_prop:
                     break
             if len(propuestas) >= limite_prop:
@@ -1362,9 +1418,9 @@ def proponer_ventanas_rostros_pdi(
     # Rejilla ligera de respaldo multi-distancia (cerca, media y lejos) en zonas sin propuesta de piel
     if incluir_rejilla_respaldo:
         for factor_l, fracs_x, fracs_y in [
-            (0.44, [0.28, 0.50, 0.72], [0.46]),
-            (0.30, [0.24, 0.50, 0.76], [0.42]),
-            (0.19, [0.22, 0.50, 0.78], [0.38]),
+            (0.41, [0.16, 0.50, 0.78], [0.56, 0.42]),
+            (0.30, [0.16, 0.42, 0.72], [0.50]),
+            (0.20, [0.22, 0.50, 0.78], [0.38]),
         ]:
             qlado = (int(min_dim * factor_l) // 2) * 2
             if qlado < lado_min or qlado > min_dim:
@@ -1375,7 +1431,9 @@ def proponer_ventanas_rostros_pdi(
                         break
                     qx = int(np.clip(round(W * fx_r - qlado / 2.0), 0, max(0, W - qlado)))
                     qy = int(np.clip(round(H * fy_r - qlado / 2.0), 0, max(0, H - qlado)))
-                    _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.35)
+                    # Usar umbral_dup=0.62 para que una caja mal encuadrada contra el techo/pared
+                    # nunca impida evaluar una ventana facial centrada en ese sector.
+                    _agregar_si_nueva([qx, qy, qlado, qlado], umbral_dup=0.62)
 
     return propuestas[:max_candidatos]
 

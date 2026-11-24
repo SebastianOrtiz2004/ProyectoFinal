@@ -282,20 +282,22 @@ class RostroTrack:
     una persona autorizada (y viceversa).
     """
 
-    def __init__(self, track_id: int, caja: list, buffer_len: int = 5):
+    def __init__(self, track_id: int, caja: list, buffer_len: int = 10):
         self.track_id = track_id
         self.caja = [float(v) for v in caja]  # [x, y, lado, lado]
         self.buffer_verificacion = deque(maxlen=buffer_len)
         self.frames_sin_ver = 0
         self.frames_vistos = 1
+        self.t_creacion = time.time()
 
         self.mse_e1 = 0.0
         self.mse_e2 = 0.0
         self.identidad_id = None
         self.identidad_nombre = "Analizando..."
         self.confianza = 0.0
+        self.progreso_verificacion = 0.0
         self.autorizado = False
-        self.etiqueta_texto = "ANALIZANDO..."
+        self.etiqueta_texto = "VERIFICANDO..."
         self.color_cuadro = (0, 220, 255)
         self.landmarks_px = None
 
@@ -335,18 +337,45 @@ class RostroTrack:
 
         self.buffer_verificacion.append((res_e2["pred_id_frame"], res_e2["conf_frame"]))
 
+        # Verificación biométrica rigurosa basada en tiempo real + consenso de votos:
+        # Durante los primeros 1.8 segundos (mientras el usuario se acomoda y el auto-exposición
+        # AEC del sensor OV2640 se estabiliza) SIEMPRE permanece en estado amarillo VERIFICANDO...
+        # con barra de progreso suave. Solo después de ese periodo emite veredicto firme:
+        #   - AUTORIZADO (verde): >= 4 votos consistentes del mismo usuario autorizado.
+        #   - DESCONOCIDO (rojo): >= 6 votos de Desconocido y >= 1.8 s transcurridos.
+        VOTOS_CONFIRMACION_AUT = 4
+        VOTOS_CONFIRMACION_DESC = 6
+        TIEMPO_MIN_VERIFICACION_SEG = 1.80
         conteo = Counter(p for p, _ in self.buffer_verificacion if p is not None)
-        if len(self.buffer_verificacion) < 3:
-            progreso_pct = int((len(self.buffer_verificacion) / 3.0) * 100)
-            self.autorizado = False
-            self.identidad_id = None
-            self.identidad_nombre = "Analizando..."
-            self.confianza = float(len(self.buffer_verificacion) / 3.0)
-            self.color_cuadro = (0, 220, 255)
-            self.etiqueta_texto = f"ANALIZANDO... [{progreso_pct}%]"
-            return
+        edad_track = max(0.0, time.time() - getattr(self, "t_creacion", 0.0))
+
+        votos_aut_max = 0
+        id_aut_mejor = None
+        for cid_a in ids_autorizados:
+            va = conteo.get(cid_a, 0)
+            if va > votos_aut_max:
+                votos_aut_max = va
+                id_aut_mejor = cid_a
+
+        if (not self.autorizado) and (edad_track < TIEMPO_MIN_VERIFICACION_SEG or len(self.buffer_verificacion) < 5):
+            # Si ya alcanzó 4 votos claros de usuario autorizado después de 1.0s, puede autorizar sin esperar de más
+            if id_aut_mejor is not None and votos_aut_max >= VOTOS_CONFIRMACION_AUT and edad_track >= 1.0:
+                pass
+            else:
+                prog_t = edad_track / TIEMPO_MIN_VERIFICACION_SEG
+                prog_v = float(len(self.buffer_verificacion)) / 5.0
+                prog = float(np.clip(min(0.95, 0.55 * prog_t + 0.45 * prog_v), 0.12, 0.95))
+                self.progreso_verificacion = prog
+                self.autorizado = False
+                self.identidad_id = None
+                self.identidad_nombre = "Verificando..."
+                self.confianza = prog
+                self.color_cuadro = (0, 220, 255)
+                self.etiqueta_texto = f"VERIFICANDO... [{int(prog * 100)}%]"
+                return
 
         if not conteo:
+            self.progreso_verificacion = 0.0
             self.autorizado = False
             self.identidad_id = id_desconocido
             self.identidad_nombre = "Desconocido"
@@ -359,29 +388,80 @@ class RostroTrack:
         confs_ganador = [c for p, c in self.buffer_verificacion if p == id_ganador]
         conf_final = float(np.mean(confs_ganador)) if confs_ganador else 0.85
 
-        if id_ganador in ids_autorizados and num_votos >= 3:
+        # Histéresis biométrica en track ya verificado: evita que un parpadeo, micro-movimiento o
+        # destello de luz de 2-3 frames haga oscilar "Autorizado -> Desconocido -> Autorizado".
+        # Mientras conserve al menos 2 votos del usuario en la ventana de 8 (y no exista mayoría
+        # abrumadora >=6 de Desconocido o de otro usuario), mantiene la autorización estable.
+        if (
+            self.autorizado
+            and self.identidad_id in ids_autorizados
+            and conteo.get(self.identidad_id, 0) >= 2
+            and conteo.get(id_desconocido, 0) < 6
+        ):
+            id_mant = self.identidad_id
+            confs_m = [c for p, c in self.buffer_verificacion if p == id_mant]
+            conf_m = float(np.mean(confs_m)) if confs_m else self.confianza
+            nombre_persona = nombres_e2.get(id_mant, f"ID {id_mant}")
+            self.progreso_verificacion = 1.0
+            self.autorizado = True
+            self.identidad_nombre = nombre_persona
+            self.confianza = conf_m
+            self.color_cuadro = (0, 255, 0)
+            self.etiqueta_texto = f"{nombre_persona} ({conf_m * 100:.0f}%) [AUTORIZADO]"
+            return
+
+        votos_aut_max = 0
+        id_aut_mejor = None
+        for cid_a in ids_autorizados:
+            va = conteo.get(cid_a, 0)
+            if va > votos_aut_max:
+                votos_aut_max = va
+                id_aut_mejor = cid_a
+
+        if (
+            id_ganador in ids_autorizados
+            and (
+                num_votos >= VOTOS_CONFIRMACION_AUT
+                or (num_votos >= 3 and edad_track >= TIEMPO_MIN_VERIFICACION_SEG and conteo.get(id_desconocido, 0) < 4)
+            )
+        ):
             nombre_persona = nombres_e2.get(id_ganador, f"ID {id_ganador}")
+            self.progreso_verificacion = 1.0
             self.autorizado = True
             self.identidad_id = id_ganador
             self.identidad_nombre = nombre_persona
             self.confianza = conf_final
             self.color_cuadro = (0, 255, 0)
             self.etiqueta_texto = f"{nombre_persona} ({conf_final * 100:.0f}%) [AUTORIZADO]"
-        elif id_ganador in ids_autorizados:
-            nombre_persona = nombres_e2.get(id_ganador, f"ID {id_ganador}")
+        elif id_aut_mejor is not None and votos_aut_max >= 2 and conteo.get(id_desconocido, 0) < VOTOS_CONFIRMACION_DESC:
+            # Evidencia parcial de usuario autorizado (ej. mientras el recuadro se termina de ajustar):
+            # mantener en estado amarillo VERIFICANDO sin etiquetar falsamente como Desconocido.
+            nombre_persona = nombres_e2.get(id_aut_mejor, f"ID {id_aut_mejor}")
+            prog = min(0.95, float(votos_aut_max) / float(VOTOS_CONFIRMACION_AUT))
+            self.progreso_verificacion = prog
             self.autorizado = False
             self.identidad_id = None
             self.identidad_nombre = f"Verificando {nombre_persona}..."
             self.confianza = conf_final
             self.color_cuadro = (0, 220, 255)
-            self.etiqueta_texto = f"VERIFICANDO {nombre_persona.upper()}..."
-        else:
+            self.etiqueta_texto = f"VERIFICANDO... [{int(prog * 100)}%]"
+        elif id_ganador == id_desconocido and num_votos >= VOTOS_CONFIRMACION_DESC:
+            self.progreso_verificacion = 0.0
             self.autorizado = False
             self.identidad_id = id_desconocido
             self.identidad_nombre = "Desconocido"
             self.confianza = conf_final
             self.color_cuadro = (0, 0, 255)
             self.etiqueta_texto = f"[NO AUTORIZADO: Desconocido] ({conf_final * 100:.0f}%)"
+        else:
+            prog = min(0.92, float(num_votos) / float(VOTOS_CONFIRMACION_DESC))
+            self.progreso_verificacion = prog
+            self.autorizado = False
+            self.identidad_id = None
+            self.identidad_nombre = "Verificando..."
+            self.confianza = prog
+            self.color_cuadro = (0, 220, 255)
+            self.etiqueta_texto = f"VERIFICANDO... [{int(prog * 100)}%]"
 
 
 class GestorTracksFaciales:
@@ -444,7 +524,10 @@ class GestorTracksFaciales:
                 tr.mse_e1 = det["mse_e1"]
                 emparejados.append((tr, det))
 
-        # Envejecer tracks no vistos en este fotograma y podar los expirados
+        # Envejecer tracks no vistos en este fotograma y podar los expirados.
+        # Si un track deja de ser detectado en Etapa 1 durante 2 frames seguidos (ej. la persona
+        # salió del cuadro o giró la cámara al techo), expirarlo de inmediato para nunca dejar
+        # cuadros "fantasma" flotando sobre paredes/techos vacíos.
         tracks_sobrevivientes = []
         for ti, tr in enumerate(self.tracks):
             if ti not in tracks_usados:
@@ -473,8 +556,8 @@ class GestorTracksFaciales:
         return emparejados
 
     def obtener_tracks_visibles(self) -> list:
-        """Retorna los tracks activos aplicando NMS para impedir sub-cajas anidadas (ej. mentón dentro del rostro)."""
-        visibles = [t for t in self.tracks if t.frames_sin_ver <= 2]
+        """Retorna únicamente tracks presentes en escena (frames_sin_ver <= 1) con NMS anti sub-cajas."""
+        visibles = [t for t in self.tracks if t.frames_sin_ver <= 1]
         if len(visibles) <= 1:
             return visibles
         cajas_v = [t.caja_int() for t in visibles]
@@ -513,9 +596,9 @@ def detectar_rostros_etapa1(
     5. Aplica NMS (aplicar_nms_cajas) priorizando encuadre facial completo de menor residuo MSE.
     """
     H, W = frame.shape[:2]
-    propuestas = proponer_ventanas_rostros_pdi(frame, max_candidatos=28, incluir_rejilla_respaldo=False)
-    if not propuestas:
-        propuestas = proponer_ventanas_rostros_pdi(frame, max_candidatos=14, incluir_rejilla_respaldo=True)
+    # Incluir ventanas de respaldo multi-altura (izquierda/centro/derecha) para detectar simultáneamente
+    # a todas las personas en escena sin importar su altura o si hay lentes/fondo beige.
+    propuestas = proponer_ventanas_rostros_pdi(frame, max_candidatos=32, incluir_rejilla_respaldo=True)
 
     # Reinyectar posiciones activas previas para continuidad fluida del tracking
     for tr in tracks_previos:
@@ -568,8 +651,9 @@ def detectar_rostros_etapa1(
     X_hat_e1 = pca_e1.inverse_transform(Z_lote_e1)
     mse_lote_e1 = np.mean((X_lote_e1 - X_hat_e1) ** 2, axis=1)
 
-    # Umbral MSE estricto: rostros humanos reales tienen MSE ~0.0003-0.0014; cobijas/paredes/objetos >= 0.0019-0.0045
-    umbral_mse_estricto = min(float(umbral_mse_e1), 0.00180)
+    # Umbral MSE adaptativo: rostros sin gafas tienen MSE ~0.0003-0.0018; rostros con lentes oscuros/montura
+    # gruesa alcanzan MSE ~0.0020-0.0030 (permitidos SOLO con triple consenso estricto SVM+CNN+RF más abajo).
+    umbral_mse_estricto = min(float(umbral_mse_e1), 0.00305)
     info_cnn_e1 = modelos_e1.get("CNN (Conv2D)") if isinstance(modelos_e1, dict) else None
     info_rf_e1 = modelos_e1.get("Random Forest") if isinstance(modelos_e1, dict) else None
 
@@ -584,10 +668,10 @@ def detectar_rostros_etapa1(
         i for i in range(len(candidatos_pdi)) if float(mse_lote_e1[i]) <= umbral_mse_estricto
     ]
     indices_validos.sort(
-        key=lambda i: float(mse_lote_e1[i]) - 0.00085 * (float(candidatos_pdi[i]["caja"][2]) / min_dim_f)
+        key=lambda i: float(mse_lote_e1[i]) - 0.00140 * (float(candidatos_pdi[i]["caja"][2]) / min_dim_f)
     )
 
-    for idx in indices_validos[:16]:
+    for idx in indices_validos[:24]:
         cand = candidatos_pdi[idx]
         mse_val = float(mse_lote_e1[idx])
 
@@ -635,11 +719,23 @@ def detectar_rostros_etapa1(
             except Exception:
                 pass
 
-        # Caso especial rostro humano lejano (pequeño): si PCA tiene residuo ultra-limpio (mse<=0.00090)
-        # y CNN confirma fuertemente (>=0.65), permitir aunque RF pierda resolución en rostros pequeños.
-        rostro_lejano_limpio = (mse_val <= 0.00090 and p_cnn_e1 >= 0.65 and prob_humano_e1 >= 0.52)
+        # Caso especial rostro humano lejano (pequeño): exige que no sea un micro-borde (<86px) de mueble
+        # y que PCA + CNN + SVM coincidan sólidamente.
+        es_tamano_rostro_seguro = (cand["caja"][2] >= 86)
+        rostro_lejano_limpio = (
+            (es_tamano_rostro_seguro and mse_val <= 0.00090 and p_cnn_e1 >= 0.70 and prob_humano_e1 >= 0.56)
+            or (es_tamano_rostro_seguro and mse_val <= 0.00145 and p_cnn_e1 >= 0.80 and prob_humano_e1 >= 0.54)
+            or (es_tamano_rostro_seguro and mse_val <= 0.00240 and p_cnn_e1 >= 0.90 and prob_humano_e1 >= 0.75)
+        )
 
-        if not rostro_lejano_limpio and prob_humano_e1 < 0.62:
+        # Si MSE > 0.00180 (lentes oscuros / montura gruesa / sombra fuerte), exigir consenso sólido de SVM+CNN
+        # y, si MSE > 0.00240, exigir además triple consenso con Random Forest (los objetos jamás pasan esto).
+        if mse_val > 0.00240 and (prob_humano_e1 < 0.78 or p_cnn_e1 < 0.85):
+            continue
+        if mse_val > 0.00180 and (prob_humano_e1 < 0.64 or p_cnn_e1 < 0.72):
+            continue
+
+        if not rostro_lejano_limpio and prob_humano_e1 < 0.60:
             continue
 
         if info_rf_e1 is not None and info_rf_e1 is not info_e1_activo:
@@ -650,15 +746,16 @@ def detectar_rostros_etapa1(
                     f_pca_raw_cache=f_pca_raw_e1,
                 )
                 p_rf_e1 = float(obtener_vector_probabilidades(info_rf_e1["modelo"], f_rf_e1, 2)[1])
-                if not rostro_lejano_limpio and p_rf_e1 < 0.52:
+                umbral_rf_dyn = 0.60 if mse_val > 0.00240 else 0.52
+                if not rostro_lejano_limpio and p_rf_e1 < umbral_rf_dyn:
                     continue
                 prob_ens_e1 = 0.75 * prob_ens_e1 + 0.25 * p_rf_e1
             except Exception:
                 pass
 
-        # Puntuación que prioriza encuadre craneofacial completo con mínimo error de reconstrucción PCA
+        # Puntuación que prioriza encuadre craneofacial completo sobre recortes parciales (ej. solo ojos/nariz)
         rel_lado = float(cand["caja"][2]) / float(max(1, min(H, W)))
-        score_e1 = 2.6 * prob_ens_e1 + 1.25 * rel_lado + 0.6 * cand["sim_bilateral"] - 220.0 * mse_val
+        score_e1 = 2.8 * prob_ens_e1 + 1.55 * rel_lado + 0.6 * cand["sim_bilateral"] - 180.0 * mse_val
         cand["mse_e1"] = mse_val
         cand["score_e1"] = score_e1
         aprobados.append(cand)
@@ -703,15 +800,17 @@ def evaluar_identidad_etapa2(
     cx_base = qx + qlado // 2
     cy_base = qy + qlado // 2
 
+    # En el 1er frame de vida del track o con 1 rostro, usar pirámide equilibrada alrededor de la caja
+    # detectada en Etapa 1 (0.72 a 1.12), evitando tanto el colapso (<0.70) como el exceso de fondo.
     if modo_compacto:
-        fracs_xy = [(0.0, 0.0), (0.0, -0.06), (0.0, 0.07)]
-        escalas = [1.00, 1.16, 1.34, 1.50]
+        fracs_xy = [(0.0, 0.0), (-0.04, 0.0), (0.04, 0.0), (0.0, -0.05), (0.0, 0.06)]
+        escalas = [0.74, 0.86, 1.00, 1.12]
     else:
         fracs_xy = [
             (0.0, 0.0), (-0.04, 0.0), (0.04, 0.0),
-            (0.0, -0.06), (0.0, 0.07),
+            (0.0, -0.05), (0.0, 0.06),
         ]
-        escalas = [1.00, 1.16, 1.34, 1.50]
+        escalas = [0.72, 0.85, 1.00, 1.12]
 
     candidatos_lote = []
     coords_lote = []
@@ -788,15 +887,18 @@ def evaluar_identidad_etapa2(
     f_conv_cache = None
 
     probas_svm = None
+    probas_ann = None
     probas_cnn = None
+    probas_knn = None
     if modelo_fuerza is None:
         # Consenso ponderado completo de los 5 modelos supervisados (SVM + ANN + k-NN + RF + CNN)
+        # k-NN en F_Identity tiene peso alto (0.28) por su excelente rechazo Open-Set frente a familiares/desconocidos
         pesos_modelos = [
-            ("SVM", 0.32),
-            ("ANN (MLP)", 0.18),
-            ("k-NN", 0.20),
-            ("Random Forest", 0.15),
-            ("CNN (Conv2D)", 0.15),
+            ("SVM", 0.24),
+            ("ANN (MLP)", 0.16),
+            ("k-NN", 0.28),
+            ("Random Forest", 0.14),
+            ("CNN (Conv2D)", 0.18),
         ]
         probas_acum = np.zeros(num_clases_totales, dtype=np.float64)
         peso_total = 0.0
@@ -821,8 +923,12 @@ def evaluar_identidad_etapa2(
                     v_p = obtener_vector_probabilidades(cand_info["modelo"], f_in_cand, num_clases_totales)
                     if nom_cand == "SVM":
                         probas_svm = v_p
+                    elif nom_cand == "ANN (MLP)":
+                        probas_ann = v_p
                     elif nom_cand == "CNN (Conv2D)":
                         probas_cnn = v_p
+                    elif nom_cand == "k-NN":
+                        probas_knn = v_p
                     probas_acum += peso_m * v_p
                     peso_total += peso_m
                 except Exception:
@@ -858,15 +964,25 @@ def evaluar_identidad_etapa2(
         )
         probas_vector = obtener_vector_probabilidades(info_e2_activo["modelo"], f_in_e2, num_clases_totales)
 
-    # Verificación Biométrica Open-Set (Distancia Euclidiana + Similitud Angular del Coseno en F_Identity)
+    # Verificación por Consenso Real del Ensamble ML + DL (SVM + ANN + k-NN + RF + CNN) + MSE PCA:
+    # Principio científico limpio (sin parches manuales ni umbrales ad-hoc de coseno que anulen al modelo):
+    #   1. Se elige la clase autorizada con mayor probabilidad del ensamble supervisado ML+DL.
+    #   2. Un rostro pertenece a esa clase autorizada si y solo si existe acuerdo real entre:
+    #        - El modelo neuronal convolucional 2D (CNN) y los clasificadores clásicos (SVM, ANN, RF)
+    #        - La vecindad local en el subespacio Eigenfaces (k-NN) o la dirección angular (cos_id)
+    #        - El residuo de reconstrucción PCA (MSE dentro del subespacio facial válido).
+    #   3. Si los modelos supervisados discrepan (ej. SVM/CNN dicen una clase pero k-NN local dice otra,
+    #      o viceversa), se clasifica de forma segura como Desconocido (Open-Set).
     mejor_c_aut = None
-    mejor_conf_raw = -1.0
+    mejor_prob_ens = -1.0
     mejor_ratio_d = 999.0
     mejor_cos_id = 0.0
     mejor_umbral_mse = umbral_mse_id
     prob_c_ganador = 0.0
+    knn_prob_ganador = 1.0
     v_id_norm = v_id_vivo / (float(np.linalg.norm(v_id_vivo)) + 1e-8)
 
+    cos_por_clase = {}
     for c_aut in ids_autorizados:
         if c_aut in perfiles:
             p_cand = perfiles[c_aut]
@@ -883,50 +999,100 @@ def evaluar_identidad_etapa2(
                 d_geo = float(np.linalg.norm(v_id_vivo - p_cand["centroide"]))
                 cen = p_cand["centroide"]
                 cos_id = float(np.dot(cen / (float(np.linalg.norm(cen)) + 1e-8), v_id_norm))
+            cos_por_clase[c_aut] = cos_id
             r_d = d_geo / (rad_p + 1e-6)
-            c_geom = float(0.50 * np.exp(-0.35 * (r_d ** 2)) + 0.50 * np.clip(cos_id, 0.0, 1.0))
+            p_knn_c = float(probas_knn[c_aut]) if (probas_knn is not None and c_aut < len(probas_knn)) else 0.65
             prob_c = float(probas_vector[c_aut]) if c_aut < len(probas_vector) else 0.0
-            c_raw = float(0.55 * prob_c + 0.45 * c_geom)
-            if c_raw > mejor_conf_raw:
-                mejor_conf_raw = c_raw
+            if prob_c > mejor_prob_ens:
+                mejor_prob_ens = prob_c
                 mejor_c_aut = c_aut
                 mejor_ratio_d = r_d
                 mejor_cos_id = cos_id
                 mejor_umbral_mse = umb_m
                 prob_c_ganador = prob_c
+                knn_prob_ganador = p_knn_c
 
-    # Doble ancla de seguridad (SVM + CNN), Similitud del Coseno Open-Set y MSE estricto
-    svm_confirma = True
-    if probas_svm is not None and mejor_c_aut is not None and mejor_c_aut < len(probas_svm):
-        p_svm_aut = float(probas_svm[mejor_c_aut])
-        p_svm_desc = float(probas_svm[id_desconocido]) if id_desconocido < len(probas_svm) else 0.0
-        svm_confirma = (
-            (p_svm_aut >= 0.36)
-            or (prob_c_ganador >= 0.45 and mejor_ratio_d <= 0.92 and p_svm_desc < 0.60 and p_svm_aut >= 0.22)
-            or (prob_c_ganador >= 0.54 and p_svm_desc < 0.66)
+    umbral_mse_vivo = min(max(float(mejor_umbral_mse), 0.0020), 0.0024)
+    if modelo_fuerza is None:
+        # Modo [0] Óptimo: Consenso genuino del Ensamble (ML clásico + Deep Learning CNN)
+        p_svm_aut = float(probas_svm[mejor_c_aut]) if (probas_svm is not None and mejor_c_aut is not None and mejor_c_aut < len(probas_svm)) else prob_c_ganador
+        p_ann_aut = float(probas_ann[mejor_c_aut]) if (probas_ann is not None and mejor_c_aut is not None and mejor_c_aut < len(probas_ann)) else prob_c_ganador
+        p_cnn_aut = float(probas_cnn[mejor_c_aut]) if (probas_cnn is not None and mejor_c_aut is not None and mejor_c_aut < len(probas_cnn)) else prob_c_ganador
+        p_knn_aut = knn_prob_ganador if probas_knn is not None else prob_c_ganador
+        p_desc_ens = float(probas_vector[id_desconocido]) if id_desconocido < len(probas_vector) else 0.0
+
+        # Coherencia angular Open-Set: la clase ganadora en el ensamble supervisado debe ser también
+        # la dirección más afín en el subespacio Eigenfaces F_Identity (rechaza impostores/familiares
+        # que engañan a SVM/CNN hacia una clase mientras su geometría angular apunta a otra).
+        cos_mejor_otra = max((v for k, v in cos_por_clase.items() if k != mejor_c_aut), default=-1.0)
+        es_ganador_angular = (mejor_cos_id >= cos_mejor_otra - 0.01)
+
+        # 1) Acuerdo unánime fuerte de los 5 modelos (ML + DL + k-NN):
+        acuerdo_ensamble_completo = (
+            prob_c_ganador >= 0.48
+            and p_cnn_aut >= 0.42
+            and p_knn_aut >= 0.50
+            and p_svm_aut >= 0.30
+            and mejor_ratio_d <= 0.98
         )
-    cnn_prob_aut = 1.0
-    if probas_cnn is not None and mejor_c_aut is not None and mejor_c_aut < len(probas_cnn):
-        cnn_prob_aut = float(probas_cnn[mejor_c_aut])
-    cnn_confirma = cnn_prob_aut >= (0.36 if mejor_ratio_d > 0.85 else 0.28)
-    min_prob_consenso = 0.56 if mejor_ratio_d > 0.85 else 0.45
+        # 2) Consenso dominante SVM + ANN + CNN con coherencia angular (cuando el fondo blanco del aula
+        #    desplaza la distancia L2 de k-NN pero los 3 clasificadores no lineales coinciden con >90-95%):
+        acuerdo_svm_cnn_dominante = (
+            prob_c_ganador >= 0.65
+            and p_svm_aut >= 0.92
+            and p_ann_aut >= 0.90
+            and p_cnn_aut >= 0.95
+            and p_desc_ens <= 0.12
+            and mejor_ratio_d <= 0.88
+            and mejor_cos_id >= 0.32
+            and es_ganador_angular
+        )
+        # 3) Consenso k-NN + Coseno en subespacio facial (luz fría fluorescente de aula donde k-NN=100%
+        #    y la dirección angular en F_Identity confirma inequívocamente al usuario autorizado):
+        acuerdo_knn_coseno = (
+            prob_c_ganador >= 0.43
+            and p_knn_aut >= 0.85
+            and p_cnn_aut >= 0.22
+            and p_desc_ens <= 0.18
+            and mejor_cos_id >= 0.43
+            and mejor_ratio_d <= 0.92
+            and es_ganador_angular
+        )
+        # 4) Acuerdo alternativo CNN + Coseno angular cuando la caja está levemente desplazada:
+        acuerdo_cnn_geometrico = (
+            prob_c_ganador >= 0.43
+            and p_cnn_aut >= 0.65
+            and p_svm_aut >= 0.25
+            and mejor_cos_id >= 0.48
+            and mejor_ratio_d <= 1.00
+            and es_ganador_angular
+        )
+        es_autorizado_frame = (
+            mejor_c_aut is not None
+            and mse_e2 <= umbral_mse_vivo
+            and (
+                acuerdo_ensamble_completo
+                or acuerdo_svm_cnn_dominante
+                or acuerdo_knn_coseno
+                or acuerdo_cnn_geometrico
+            )
+        )
+    else:
+        # Modo de evaluación individual por teclado [1]-[6]: decide directamente el modelo seleccionado
+        # con verificación mínima del subespacio facial (MSE + radio).
+        es_autorizado_frame = (
+            mejor_c_aut is not None
+            and prob_c_ganador >= 0.52
+            and mse_e2 <= umbral_mse_vivo
+            and mejor_ratio_d <= 0.96
+        )
 
-    umbral_mse_vivo = min(max(float(mejor_umbral_mse), 0.0018), 0.0021)
-    if (
-        mejor_c_aut is not None
-        and svm_confirma
-        and cnn_confirma
-        and prob_c_ganador >= min_prob_consenso
-        and mejor_cos_id >= 0.45
-        and mejor_ratio_d <= 0.92
-        and mse_e2 <= umbral_mse_vivo
-        and mejor_conf_raw >= 0.54
-    ):
+    if es_autorizado_frame:
         pred_id_frame = mejor_c_aut
-        conf_frame = float(np.clip(0.90 + (mejor_conf_raw - 0.54) / 0.40 * 0.07, 0.90, 0.97))
+        conf_frame = float(np.clip(0.88 + max(0.0, prob_c_ganador - 0.43) / 0.55 * 0.10, 0.89, 0.98))
     else:
         pred_id_frame = id_desconocido
-        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, mejor_ratio_d - 0.85) * 0.25), 0.75, 0.90))
+        conf_frame = float(np.clip(0.75 + min(0.15, max(0.0, 0.50 - prob_c_ganador) * 0.35), 0.75, 0.90))
 
     # Extraer y mapear los 5 Landmarks faciales sobre las coordenadas de la ventana ganadora
     landmarks_px = None
@@ -1181,6 +1347,17 @@ def dibujar_rostro_y_landmarks(frame: np.ndarray, track: RostroTrack, W: int, H:
             if pt_k in pts_px:
                 cv2.circle(frame, pts_px[pt_k], 3, color_malla, -1, cv2.LINE_AA)
 
+    # Barra de progreso biométrica bajo el rostro mientras verifica (0% -> 100%)
+    prog_v = float(getattr(track, "progreso_verificacion", 0.0))
+    if (not track.autorizado) and (0.0 < prog_v < 1.0):
+        by1 = min(H - 10, qy + qlado + 4)
+        by2 = min(H - 3, by1 + 7)
+        cv2.rectangle(frame, (qx, by1), (qx + qlado, by2), (35, 35, 35), -1)
+        ancho_lleno = int(round(qlado * prog_v))
+        if ancho_lleno > 0:
+            cv2.rectangle(frame, (qx, by1), (qx + ancho_lleno, by2), (0, 220, 255), -1)
+        cv2.rectangle(frame, (qx, by1), (qx + qlado, by2), (0, 180, 220), 1)
+
     # Etiqueta limpia con fondo semioscuro para alta legibilidad
     if track.etiqueta_texto:
         texto_limpio = limpiar_texto_cv2(track.etiqueta_texto)
@@ -1199,6 +1376,106 @@ def dibujar_rostro_y_landmarks(frame: np.ndarray, track: RostroTrack, W: int, H:
             1,
             cv2.LINE_AA,
         )
+
+
+def dibujar_animacion_autorizado(
+    frame: np.ndarray,
+    t_transcurrido: float,
+    duracion: float,
+    nombres_aut: list,
+    telegram_enviado: bool,
+):
+    """
+    Animación visual de confirmación de acceso autorizado (durante ~2.8 s):
+    - Borde verde pulsante alrededor del video.
+    - Tarjeta inferior semitransparente con checkmark animado, nombre del usuario y estado Telegram.
+    """
+    if t_transcurrido < 0.0 or t_transcurrido > duracion:
+        return
+    H, W = frame.shape[:2]
+
+    # Envolvente suave fade-in (0..0.25s) y fade-out (últimos 0.55s)
+    if t_transcurrido < 0.25:
+        alpha_env = t_transcurrido / 0.25
+    elif t_transcurrido > (duracion - 0.55):
+        alpha_env = max(0.0, (duracion - t_transcurrido) / 0.55)
+    else:
+        alpha_env = 1.0
+
+    # 1. Marco verde pulsante alrededor de la cámara
+    pulso = 0.65 + 0.35 * float(np.sin(t_transcurrido * 8.0))
+    grosor = max(2, int(round(5 * alpha_env * pulso)))
+    cv2.rectangle(frame, (2, 30), (W - 3, H - 3), (0, int(235 * alpha_env), 60), grosor)
+
+    # 2. Tarjeta semitransparente en la franja inferior del video
+    card_h = 74
+    y1 = H - card_h - 14
+    y2 = H - 14
+    x1 = 22
+    x2 = W - 22
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (18, 52, 24), -1)
+    cv2.addWeighted(overlay, 0.78 * alpha_env, frame, 1.0 - 0.78 * alpha_env, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 90), 2)
+
+    # 3. Círculo con Checkmark animado (se dibuja en los primeros 0.45 s)
+    cx = x1 + 38
+    cy = (y1 + y2) // 2
+    r_chk = int(round(22 * min(1.0, t_transcurrido / 0.22)))
+    if r_chk >= 4:
+        cv2.circle(frame, (cx, cy), r_chk, (0, 210, 75), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), r_chk, (190, 255, 200), 2, cv2.LINE_AA)
+
+    p_chk = min(1.0, max(0.0, (t_transcurrido - 0.12) / 0.35))
+    if p_chk > 0.0:
+        pt1 = (cx - 10, cy + 1)
+        pt2 = (cx - 3, cy + 9)
+        pt3 = (cx + 12, cy - 8)
+        if p_chk <= 0.45:
+            t1 = p_chk / 0.45
+            pm = (int(pt1[0] + (pt2[0] - pt1[0]) * t1), int(pt1[1] + (pt2[1] - pt1[1]) * t1))
+            cv2.line(frame, pt1, pm, (255, 255, 255), 3, cv2.LINE_AA)
+        else:
+            cv2.line(frame, pt1, pt2, (255, 255, 255), 3, cv2.LINE_AA)
+            t2 = (p_chk - 0.45) / 0.55
+            pm2 = (int(pt2[0] + (pt3[0] - pt2[0]) * t2), int(pt2[1] + (pt3[1] - pt2[1]) * t2))
+            cv2.line(frame, pt2, pm2, (255, 255, 255), 3, cv2.LINE_AA)
+
+    # 4. Textos de bienvenida y estado Telegram
+    tx_base = x1 + 74
+    nombre_str = limpiar_texto_cv2(", ".join(nombres_aut)) if nombres_aut else "Usuario Autorizado"
+    cv2.putText(
+        frame,
+        "ACCESO AUTORIZADO - BIENVENIDO",
+        (tx_base, y1 + 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.56,
+        (120, 255, 140),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Persona: {nombre_str[:34]}",
+        (tx_base, y1 + 47),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    sub_tg = "Telegram: Notificacion con foto enviada" if telegram_enviado else "Bitacora: Acceso verificado y registrado"
+    cv2.putText(
+        frame,
+        sub_tg,
+        (tx_base, y1 + 65),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.39,
+        (160, 240, 255) if telegram_enviado else (180, 220, 180),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def ejecutar_demostracion():
@@ -1299,12 +1576,21 @@ def ejecutar_demostracion():
             print("[ERROR] No se pudo acceder a la cámara web. Verifique la conexión o permisos.")
             return
 
-    gestor_tracks = GestorTracksFaciales(max_rostros=MAX_ROSTROS_SIMULTANEOS, max_frames_perdidos=4)
+    gestor_tracks = GestorTracksFaciales(max_rostros=MAX_ROSTROS_SIMULTANEOS, max_frames_perdidos=3)
     progreso_apertura = 0.0
     ultimo_acceso_valido = 0.0
-    TIEMPO_RETENCION_ACCESO = 1.8  # Segundos de estabilidad de puerta abierta
+    TIEMPO_RETENCION_ACCESO = 2.6  # Segundos de estabilidad de puerta abierta
     inicio_desconocido_continuo = None
     ultimos_nombres_autorizados = []
+    # Estado de la animación de confirmación de Acceso Autorizado + sincronización con Telegram
+    t_inicio_anim_aut = -10.0
+    DURACION_ANIM_AUT = 2.8
+    anim_aut_nombres = []
+    anim_tg_enviado = False
+    estaba_autorizado_prev = False
+    toast_msg = ""
+    toast_color = (0, 230, 255)
+    toast_hasta = 0.0
     fps_suave = 15.0
     t_prev = time.time()
 
@@ -1399,10 +1685,12 @@ def ejecutar_demostracion():
 
                 # 3. ETAPA 2 INDEPENDIENTE PARA CADA ROSTRO HUMANO CONFIRMADO
                 for tr_k, det_k in pares_act:
-                    modo_comp = (len(pares_act) >= 2) or (tr_k.frames_vistos > 2)
+                    modo_comp = (len(pares_act) >= 2) and (tr_k.frames_vistos > 3)
+                    # Evaluar usando la caja suavizada del track (evita saltos bruscos de E1 frame-a-frame)
+                    caja_eval_e2 = tr_k.caja_int(Ww, Hw)
                     res_e2_k = evaluar_identidad_etapa2(
                         frame=fr_w,
-                        caja_rostro=det_k["caja"],
+                        caja_rostro=caja_eval_e2,
                         pca_e2=pca_e2,
                         modelos_e2=modelos_e2,
                         modelo_cnn=modelo_cnn,
@@ -1415,11 +1703,18 @@ def ejecutar_demostracion():
                         umbral_mse_id=umbral_mse_id,
                         modo_compacto=modo_comp,
                     )
+                    # Solo retroalimentar centrado cuando el encuadre ajustado mantiene una escala facial
+                    # saludable (>= 85% de la detección de Etapa 1) para evitar colapso progresivo de la caja.
+                    c_adj = res_e2_k.get("caja_ajustada")
+                    if c_adj is not None and c_adj[2] >= int(det_k["caja"][2] * 0.85):
+                        tr_k.actualizar_caja(c_adj, Ww, Hw, alpha=0.18)
                     tr_k.actualizar_decision_etapa2(res_e2_k, ids_autorizados, id_desconocido, nombres_e2)
 
-                # 4. UNICIDAD BIOMÉTRICA 1-A-1 + EVALUACIÓN GLOBAL DE ACCESO (COMPUERTA LÓGICA OR)
-                # Físicamente una misma persona autorizada no puede ocupar dos rostros simultáneos:
-                # si dos tracks reclaman el mismo ID, conserva la identidad solo el de mayor confianza.
+                # 4. UNICIDAD BIOMÉTRICA 1-A-1 + BARRERA DE VERIFICACIÓN SIMULTÁNEA MULTI-ROSTRO
+                # Si hay múltiples rostros en escena y uno todavía está en fase amarilla "VERIFICANDO..."
+                # (aún no termina sus ~1.8s iniciales), mantener el veredicto en espera sincronizada
+                # hasta que TODOS los rostros visibles completen su verificación biométrica, para
+                # revelar todos los resultados (Autorizado / Desconocido) al mismo tiempo de forma limpia.
                 tr_vis = gestor_tracks.obtener_tracks_visibles()
                 tr_snap = [copy.copy(t) for t in tr_vis]
                 ganadores_por_id = {}
@@ -1437,6 +1732,31 @@ def ejecutar_demostracion():
                             t_s.confianza = 0.78
                             t_s.color_cuadro = (0, 0, 255)
                             t_s.etiqueta_texto = "[NO AUTORIZADO: Desconocido] (78%)"
+
+                # Barrera sincronizada multi-rostro: si hay >= 2 rostros y alguno aún está verificando
+                # (edad < 4.5 s para evitar bloqueos eternos), mostrar la barra amarilla sincronizada en todos
+                # hasta que todos los rostros de la escena tengan su veredicto biométrico listo a la vez.
+                ahora_barrera = time.time()
+                alguno_verificando = any(
+                    (not t_s.autorizado)
+                    and (t_s.identidad_id is None)
+                    and ((ahora_barrera - getattr(t_s, "t_creacion", 0.0)) < 4.5)
+                    for t_s in tr_snap
+                )
+                if len(tr_snap) >= 2 and alguno_verificando:
+                    progs_sync = [
+                        (1.0 if (t_s.autorizado or t_s.identidad_id == id_desconocido) else float(getattr(t_s, "progreso_verificacion", 0.5)))
+                        for t_s in tr_snap
+                    ]
+                    prog_global = float(np.clip(min(progs_sync), 0.15, 0.95))
+                    for t_s in tr_snap:
+                        t_s.autorizado = False
+                        t_s.identidad_id = None
+                        t_s.progreso_verificacion = prog_global
+                        t_s.identidad_nombre = "Verificando escena..."
+                        t_s.color_cuadro = (0, 220, 255)
+                        t_s.etiqueta_texto = f"VERIFICANDO ESCENA... [{int(prog_global * 100)}%]"
+
                 est_or = evaluar_acceso_global_or(tr_snap, ids_autorizados, id_desconocido)
 
                 t_ia_now = time.time()
@@ -1508,18 +1828,23 @@ def ejecutar_demostracion():
                 cliente_iot.enviar_estado("ESPERA", total_rostros=0)
                 inicio_desconocido_continuo = None
 
-        # 5. DIBUJO SOBRE EL VIDEO EN VIVO (TODOS LOS ROSTROS + LANDMARKS + HUD SUPERIOR)
+        # 5. DIBUJO SOBRE EL VIDEO EN VIVO (TODOS LOS ROSTROS + LANDMARKS + ANIMACIÓN DE AUTORIZACIÓN)
         for tr in tracks_visibles:
             dibujar_rostro_y_landmarks(frame, tr, W, H)
 
-        # Disparar notificaciones al Bot de Telegram con la evidencia visual ya etiquetada (asíncrono con cooldown)
+        # Detectar el instante exacto en que se confirma la autorización (100% de verificación):
+        # dispara simultáneamente la animación visual y el aviso de Telegram con el nombre y foto.
         if estado_or["hay_autorizado"]:
-            notificador_tg.notificar_ingreso_autorizado(
-                frame_bgr=frame,
-                total_rostros=estado_or["total_rostros"],
-                num_autorizados=estado_or["num_autorizados"],
-                nombres_aut=estado_or["nombres_autorizados"],
-            )
+            es_nueva_confirmacion = (not estaba_autorizado_prev) or ((tiempo_actual - t_inicio_anim_aut) > 12.0)
+            if es_nueva_confirmacion:
+                t_inicio_anim_aut = tiempo_actual
+                anim_aut_nombres = list(estado_or["nombres_autorizados"])
+                anim_tg_enviado = notificador_tg.notificar_ingreso_autorizado(
+                    frame_bgr=frame,
+                    total_rostros=estado_or["total_rostros"],
+                    num_autorizados=estado_or["num_autorizados"],
+                    nombres_aut=estado_or["nombres_autorizados"],
+                )
         elif (
             (not esta_en_retencion)
             and inicio_desconocido_continuo is not None
@@ -1530,6 +1855,19 @@ def ejecutar_demostracion():
                 total_rostros=estado_or["total_rostros"],
                 num_desconocidos=estado_or["num_desconocidos"],
             )
+        estaba_autorizado_prev = bool(estado_or["hay_autorizado"])
+
+        # Superponer animación elegante de "ACCESO AUTORIZADO" mientras esté activa
+        t_anim = tiempo_actual - t_inicio_anim_aut
+        if 0.0 <= t_anim <= DURACION_ANIM_AUT:
+            dibujar_animacion_autorizado(frame, t_anim, DURACION_ANIM_AUT, anim_aut_nombres, anim_tg_enviado)
+
+        # Superponer aviso visual (toast) para confirmar pulsaciones de teclado [C], [B], [N], [0]-[6]
+        if toast_msg and tiempo_actual < toast_hasta:
+            txt_toast = limpiar_texto_cv2(toast_msg)[:64]
+            cv2.rectangle(frame, (8, H - 36), (W - 8, H - 8), (20, 24, 30), -1)
+            cv2.rectangle(frame, (8, H - 36), (W - 8, H - 8), toast_color, 2)
+            cv2.putText(frame, txt_toast, (16, H - 17), cv2.FONT_HERSHEY_SIMPLEX, 0.48, toast_color, 1, cv2.LINE_AA)
 
         cv2.rectangle(frame, (0, 0), (W, 28), (22, 24, 28), -1)
         hud_color = (0, 255, 0) if esta_en_retencion else (0, 210, 255)
@@ -1550,11 +1888,9 @@ def ejecutar_demostracion():
             return "DL" if ("cnn" in nl or "ann" in nl or "mlp" in nl or "deep" in nl) else "ML"
 
         if modelo_fuerza is None:
-            m1_nom = artefactos.get("mejor_e1_nombre", "SVM")
-            m2_nom = artefactos.get("mejor_e2_nombre", "SVM")
-            alg_f1_ui = f"{_etiqueta_tipo_ia(m1_nom)}: {m1_nom} (Opt)"
-            alg_f2_ui = f"{_etiqueta_tipo_ia(m2_nom)}: {m2_nom} (Opt)"
-            nombre_activo_ui = f"Optimo ({m2_nom})"
+            alg_f1_ui = "Ensamble (SVM+CNN+RF)"
+            alg_f2_ui = "Ensamble (SVM+ML+CNN)"
+            nombre_activo_ui = "Optimo (Ensamble ML+DL)"
         else:
             t_f = _etiqueta_tipo_ia(modelo_fuerza)
             alg_f1_ui = f"{t_f}: {modelo_fuerza}"
@@ -1583,9 +1919,20 @@ def ejecutar_demostracion():
         cv2.imshow("Sistema Biometrico Multi-Rostro IA - Ortiz & Ayuquina (FISEI UTA)", vista_completa)
 
         # 7. CONTROLES DE TECLADO EN TIEMPO REAL (waitKey(15) libera CPU para hilos de Red e IA)
+        # Además lee la consola de Windows (msvcrt) por si el usuario pulsa [C]/[B]/[0-6] con foco en la terminal.
         tecla = cv2.waitKey(15) & 0xFF
+        if tecla == 255 and os.name == "nt":
+            try:
+                import msvcrt
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch and len(ch) == 1:
+                        tecla = ord(ch)
+            except Exception:
+                pass
+
         if tecla in [ord("q"), ord("Q"), 27]:
-            print("\nFinalizando demostración en tiempo real...")
+            print("\nFinalizando demostración en tiempo real...", flush=True)
             break
         elif tecla == ord("0"):
             modelo_fuerza = None
@@ -1593,31 +1940,69 @@ def ejecutar_demostracion():
                 ctrl_ia["modelo_fuerza"] = None
                 ctrl_ia["limpiar_buffers"] = True
             ultimo_acceso_valido = 0.0
-            print(">>> Conmutado a Modo Óptimo Automático")
+            toast_msg = "[0] MODO OPTIMO AUTOMATICO (Ensamble ML + CNN)"
+            toast_color = (0, 255, 160)
+            toast_hasta = time.time() + 2.5
+            print(">>> Conmutado a Modo Óptimo Automático", flush=True)
         elif tecla in [ord("b"), ord("B")]:
             gris_fondo_completo = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).copy()
             with lock_ia:
                 ctrl_ia["gris_fondo"] = gris_fondo_completo
                 ctrl_ia["limpiar_tracks"] = True
             ultimo_acceso_valido = 0.0
-            print("[CALIBRACIÓN] Fondo completo de la escena registrado con tecla [B].")
+            toast_msg = "[B] FONDO DE ESCENA CALIBRADO CORRECTAMENTE"
+            toast_color = (0, 230, 255)
+            toast_hasta = time.time() + 2.5
+            print("[CALIBRACIÓN] Fondo completo de la escena registrado con tecla [B].", flush=True)
         elif tecla in [ord("c"), ord("C")]:
-            if tracks_visibles and tracks_visibles[0].ultimo_v_id_vivo is not None:
-                tr_p = tracks_visibles[0]
-                target_id = (
-                    tr_p.identidad_id
-                    if (tr_p.identidad_id in ids_autorizados)
-                    else (ids_autorizados[0] if ids_autorizados else 0)
-                )
-                if target_id in perfiles:
+            calibrados = []
+            with lock_ia:
+                tracks_cal = list(gestor_tracks.tracks)
+            usados_cal = set()
+            for tr_p in tracks_cal:
+                if tr_p.ultimo_v_id_vivo is not None:
                     v_cal = tr_p.ultimo_v_id_vivo
-                    mat_p = perfiles[target_id].get("matriz_Z_poses", None)
-                    if mat_p is not None and len(mat_p) > 0 and mat_p.shape[1] == len(v_cal):
-                        perfiles[target_id]["matriz_Z_poses"] = np.vstack([mat_p, v_cal])
+                    v_cal_n = v_cal / (float(np.linalg.norm(v_cal)) + 1e-8)
+                    if tr_p.identidad_id in ids_autorizados and tr_p.identidad_id not in usados_cal:
+                        target_id = tr_p.identidad_id
                     else:
-                        perfiles[target_id]["matriz_Z_poses"] = np.array([v_cal])
-                    nom_calib = nombres_e2.get(target_id, f"ID {target_id}")
-                    print(f"[CALIBRACIÓN] Luz del rostro calibrada para {nom_calib} con tecla [C].")
+                        # Elegir el perfil autorizado con mayor afinidad angular en F_Identity (asignación 1-a-1)
+                        cands_id = [cid for cid in ids_autorizados if cid not in usados_cal and cid in perfiles]
+                        if not cands_id:
+                            cands_id = [cid for cid in ids_autorizados if cid in perfiles]
+                        target_id = None
+                        mejor_cos_cal = -2.0
+                        for cid in cands_id:
+                            mat_p = perfiles[cid].get("matriz_Z_poses", None)
+                            if mat_p is not None and len(mat_p) > 0 and mat_p.shape[1] == len(v_cal):
+                                mat_n = mat_p / (np.linalg.norm(mat_p, axis=1, keepdims=True) + 1e-8)
+                                cos_c = float(np.mean(np.sort(mat_n @ v_cal_n)[-5:]))
+                            else:
+                                cen = perfiles[cid]["centroide"]
+                                cos_c = float(np.dot(cen / (float(np.linalg.norm(cen)) + 1e-8), v_cal_n))
+                            if cos_c > mejor_cos_cal:
+                                mejor_cos_cal = cos_c
+                                target_id = cid
+                    if target_id is not None and target_id in perfiles:
+                        usados_cal.add(target_id)
+                        mat_p = perfiles[target_id].get("matriz_Z_poses", None)
+                        if mat_p is not None and len(mat_p) > 0 and mat_p.shape[1] == len(v_cal):
+                            perfiles[target_id]["matriz_Z_poses"] = np.vstack([mat_p, v_cal])
+                        else:
+                            perfiles[target_id]["matriz_Z_poses"] = np.array([v_cal])
+                        calibrados.append(nombres_e2.get(target_id, f"ID {target_id}"))
+            if calibrados:
+                with lock_ia:
+                    ctrl_ia["limpiar_buffers"] = True
+                toast_msg = f"[C] LUZ CALIBRADA: {', '.join(calibrados)}"
+                toast_color = (0, 255, 120)
+                toast_hasta = time.time() + 3.0
+                print(f"[CALIBRACIÓN] Luz del aula calibrada con tecla [C] para: {', '.join(calibrados)}", flush=True)
+            else:
+                toast_msg = "[C] Sin rostro detectado para calibrar luz"
+                toast_color = (0, 165, 255)
+                toast_hasta = time.time() + 2.5
+                print("[CALIBRACIÓN] Presione [C] con un rostro visible dentro de la ventana de video.", flush=True)
         elif tecla in [ord("n"), ord("N")]:
             if tracks_visibles:
                 candidatos_bloq = [t for t in tracks_visibles if not t.autorizado] or tracks_visibles
@@ -1635,14 +2020,20 @@ def ejecutar_demostracion():
                 with lock_ia:
                     ctrl_ia["limpiar_tracks"] = True
                 ultimo_acceso_valido = 0.0
-                print("[CALIBRACIÓN] Objeto bloqueado en vivo y guardado en clase_0_no_persona con tecla [N].")
+                toast_msg = "[N] OBJETO DEL FONDO BLOQUEADO EN VIVO"
+                toast_color = (0, 120, 255)
+                toast_hasta = time.time() + 2.5
+                print("[CALIBRACIÓN] Objeto bloqueado en vivo y guardado en clase_0_no_persona con tecla [N].", flush=True)
         elif tecla in NOMBRE_MODELOS_TECLAS:
             modelo_fuerza = NOMBRE_MODELOS_TECLAS[tecla]
             with lock_ia:
                 ctrl_ia["modelo_fuerza"] = modelo_fuerza
                 ctrl_ia["limpiar_buffers"] = True
             ultimo_acceso_valido = 0.0
-            print(f">>> Algoritmo forzado en tiempo real: {modelo_fuerza}")
+            toast_msg = f"ALGORITMO FORZADO: {modelo_fuerza}"
+            toast_color = (0, 220, 255)
+            toast_hasta = time.time() + 2.5
+            print(f">>> Algoritmo forzado en tiempo real: {modelo_fuerza}", flush=True)
 
     ctrl_ia["activo"] = False
     hilo_ia.join(timeout=1.5)

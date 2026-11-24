@@ -30,6 +30,8 @@ from utils_pdi import (
     detectar_rostro_principal,
     proponer_ventanas_rostros_pdi,
     verificar_estructura_facial_pdi,
+    extraer_descriptor_espacial_bloques,
+    extraer_puntos_faciales_landmarks_pdi,
     aplicar_nms_cajas,
     calcular_nitidez_laplaciano,
     cv2_imread_unicode,
@@ -118,19 +120,27 @@ def opcion_captura_webcam():
     print("\n" + "=" * 70)
     print("OPCIÓN 1: CAPTURA DE DATASET (ESP32-CAM IoT / CÁMARA WEB LAPTOP)")
     print("=" * 70)
+    ip_predeterminada = cfg_esp.get("ip", "10.198.13.94")
+    puerto_ctrl = int(cfg_esp.get("puerto_control", 80))
+    puerto_str = int(cfg_esp.get("puerto_stream", 81))
     print("Seleccione la fuente de cámara:")
-    print("  [1] Cámara IoT ESP32-CAM por Wi-Fi (IP por defecto: 192.168.4.1)")
+    print(f"  [1] Cámara IoT ESP32-CAM por Wi-Fi (IP en config_iot.json: {ip_predeterminada}:{puerto_str})")
     print("  [2] Cámara Web de la Laptop (índice 0)")
     opc_cam = input("Fuente [1=ESP32-CAM, 2=Laptop, Enter=2]: ").strip()
 
     usar_esp32 = (opc_cam == "1")
     if usar_esp32:
-        ip_predeterminada = cfg_esp.get("ip", "192.168.100.77")
         ip_in = input(f"IP del ESP32-CAM [Enter para usar {ip_predeterminada}]: ").strip()
         ip_esp = ip_in if ip_in else ip_predeterminada
-        # Conexión directa al stream en WebServer.h (puerto 80 en '/')
-        url_stream = f"http://{ip_esp}/"
-        url_capture = None
+        # Usa la misma configuración de puertos de config_iot.json que 3_reconocimiento_en_vivo.py:
+        #   - puerto_stream == 80 -> http://<ip>/
+        #   - puerto_stream == 81 -> http://<ip>:81/stream (+ respaldo /capture en puerto_control)
+        if puerto_str == 80:
+            url_stream = f"http://{ip_esp}/"
+            url_capture = None
+        else:
+            url_stream = f"http://{ip_esp}:{puerto_str}/stream"
+            url_capture = f"http://{ip_esp}:{puerto_ctrl}/capture"
         fuente = url_stream
         prefijo_cam = "esp32"
         voltear_h = bool(cfg_esp.get("voltear_horizontal", False))
@@ -189,13 +199,55 @@ def opcion_captura_webcam():
     ultimo_tiempo_auto = 0.0
     img_anterior_64 = None
     UMBRAL_NITIDEZ_MIN = 15.0  # Filtra frames movidos/borrosos del ESP32-CAM
+    caja_suave_acq = None
+    frames_sin_rostro_acq = 0
+    factor_fijo = 0.46
+    nombre_limpio = (
+        nombre_sel.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+        .replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
+        .replace("ñ", "n").replace("Ñ", "N")
+    )
+
+    def _evaluar_svm_etapa1_acq(vec_c: np.ndarray):
+        """Evalúa el mismo vector completo [PCA + MSE + PDI + Landmarks] que 3_reconocimiento_en_vivo.py."""
+        if mod_e1_acq is None or pca_e1_acq is None:
+            return 0.70, 0.0015
+        x = vec_c.reshape(1, -1)
+        z = pca_e1_acq.transform(x)
+        x_hat = pca_e1_acq.inverse_transform(z)
+        mse_v = float(np.mean((x - x_hat) ** 2))
+        im = vec_c.reshape(64, 64)
+        gy = np.abs(cv2.Sobel(im, cv2.CV_64F, 0, 1, ksize=3))
+        gx = np.abs(cv2.Sobel(im, cv2.CV_64F, 1, 0, ksize=3))
+        peso = gy + np.maximum(0.0, 0.45 - im)
+        cx_f = float(np.sum(np.arange(64) * np.sum(peso, axis=0)) / (np.sum(peso) + 1e-6))
+        cx = int(np.clip(round(cx_f), 24, 40))
+        w_sim = min(cx, 63 - cx)
+        s_cx = 1.0 - float(np.mean(np.abs(im[:, cx - w_sim : cx] - np.fliplr(im[:, cx : cx + w_sim]))))
+        s_cent = 1.0 - float(np.mean(np.abs(im[:, :32] - np.fliplr(im[:, 32:]))))
+        sim = max(s_cent, s_cx)
+        ratio_hv = float(np.mean(gy) / (np.mean(gx) + 1e-6))
+        desc_b = extraer_descriptor_espacial_bloques(im)
+        land_12, _ = extraer_puntos_faciales_landmarks_pdi(im)
+        pdi_feats = np.concatenate([[sim, ratio_hv], desc_b, land_12]).reshape(1, -1)
+        f = np.hstack([z, np.array([[mse_v]]), pdi_feats])
+        sc_e1 = mod_e1_acq.get("scaler", None)
+        if sc_e1 is not None:
+            f = sc_e1.transform(f)
+        mod_obj = mod_e1_acq["modelo"]
+        if hasattr(mod_obj, "predict_proba"):
+            prob_h = float(mod_obj.predict_proba(f)[0, 1])
+        else:
+            prob_h = 0.85 if int(mod_obj.predict(f)[0]) == 1 else 0.15
+        return prob_h, mse_v
 
     print(f"\nCámara iniciada ({'ESP32-CAM IoT' if usar_esp32 else 'Laptop'}) para: {nombre_sel}")
     print(f"Meta sugerida en esta sesión: +{meta_nuevas} muestras nuevas (varía distancia: cerca, media, lejos y leves giros).")
     print("Controles:")
     print("  - [ESPACIO]: Captura manual inmediata")
     print("  - [A]: Alternar ráfaga automática (cada 0.22s con filtro anti-borroso y anti-duplicado)")
-    print("  - [T]: Alternar encuadre: AUTO-SEGUIMIENTO PDI vs RECUADRO FIJO CENTRAL")
+    print("  - [T]: Alternar encuadre: AUTO-SEGUIMIENTO PDI vs RECUADRO FIJO CENTRAL (estable)")
+    print("  - [+] / [-]: Agrandar o reducir el recuadro en modo FIJO")
     print("  - [F]: Capturar directamente OBJETO / CHAQUETA / FONDO en Clase 0")
     print("  - [Q / ESC]: Terminar captura\n")
 
@@ -210,49 +262,69 @@ def opcion_captura_webcam():
         H, W = frame.shape[:2]
         frame_vis = frame.copy()
 
-        cuadrado_fijo, esquinas_fondo = obtener_rejilla_ventanas_geometrica(W, H, factor_central=0.38)
+        cuadrado_fijo, esquinas_fondo = obtener_rejilla_ventanas_geometrica(W, H, factor_central=factor_fijo)
         caja_activa = cuadrado_fijo
         rostro_pdi_valido = (id_sel == 4)
 
         if modo_auto_recorte and id_sel != 4:
-            # Usar el MISMO generador multi-rostro PDI + supresión anatómica de cuello que en 3_reconocimiento_en_vivo.py
+            # Usar el MISMO generador multi-rostro PDI + validador completo SVM/MSE de Etapa 1
             propuestas = proponer_ventanas_rostros_pdi(frame, max_candidatos=16, incluir_rejilla_respaldo=False)
             cajas_ok_pdi = []
             scores_ok_pdi = []
+            min_lado_rostro = max(105, int(min(W, H) * 0.22))
             for cand in propuestas:
                 cx_c, cy_c, cl_c, _ = cand
+                if cl_c < min_lado_rostro:
+                    continue  # Ignorar objetos pequeños / lámparas del techo
                 parche_c = frame[cy_c : cy_c + cl_c, cx_c : cx_c + cl_c]
-                if parche_c.shape[0] < 48 or parche_c.shape[1] < 48:
+                if parche_c.shape[0] < min_lado_rostro or parche_c.shape[1] < min_lado_rostro:
                     continue
                 im_c, vec_c = preprocesar_ventana_64x64(parche_c)
                 ok_pdi, met_pdi = verificar_estructura_facial_pdi(parche_c, im_c)
                 if ok_pdi:
-                    prob_humano = 0.50
-                    if mod_e1_acq is not None and pca_e1_acq is not None:
-                        try:
-                            f_raw = pca_e1_acq.transform(vec_c.reshape(1, -1))
-                            sc_e1 = mod_e1_acq.get("scaler", None)
-                            f_in = sc_e1.transform(f_raw) if sc_e1 is not None else f_raw
-                            mod_obj = mod_e1_acq["modelo"]
-                            if hasattr(mod_obj, "predict_proba"):
-                                prob_humano = float(mod_obj.predict_proba(f_in)[0, 1])
-                            else:
-                                prob_humano = 0.85 if int(mod_obj.predict(f_in)[0]) == 1 else 0.15
-                        except Exception:
-                            prob_humano = 0.50
+                    try:
+                        prob_humano, mse_e1_c = _evaluar_svm_etapa1_acq(vec_c)
+                    except Exception:
+                        prob_humano, mse_e1_c = 0.0, 1.0
 
-                    if prob_humano < 0.50:
-                        continue  # Rechazar cuellos, capuchas o pliegues de ropa
+                    if prob_humano < 0.65 or mse_e1_c > 0.0036:
+                        continue  # Rechazar lámparas, techo, cuellos o fondos iluminados
 
                     dist_centro = np.hypot((cx_c + cl_c * 0.5) - W * 0.5, (cy_c + cl_c * 0.45) - H * 0.42) / float(W)
-                    score = 2.0 * prob_humano + float(met_pdi.get("sim_bilateral", 0.0)) - 0.8 * dist_centro
+                    score = 2.5 * prob_humano + float(met_pdi.get("sim_bilateral", 0.0)) - 0.8 * dist_centro
                     cajas_ok_pdi.append(cand)
                     scores_ok_pdi.append(score)
             idx_nms = aplicar_nms_cajas(cajas_ok_pdi, scores_ok_pdi, umbral_iou=0.25, umbral_contencion=0.45)
             if idx_nms:
-                caja_activa = cajas_ok_pdi[idx_nms[0]]
+                det_cand = cajas_ok_pdi[idx_nms[0]]
+                if caja_suave_acq is None:
+                    caja_suave_acq = [float(v) for v in det_cand]
+                else:
+                    # Suavizado exponencial EMA anti-parpadeo y anti-saltos bruscos
+                    alpha_s = 0.28
+                    for k_i in range(4):
+                        caja_suave_acq[k_i] = alpha_s * float(det_cand[k_i]) + (1.0 - alpha_s) * caja_suave_acq[k_i]
+                ql_s = max(min_lado_rostro, min(int(round(caja_suave_acq[2])), min(W, H)))
+                qx_s = int(np.clip(round(caja_suave_acq[0]), 0, max(0, W - ql_s)))
+                qy_s = int(np.clip(round(caja_suave_acq[1]), 0, max(0, H - ql_s)))
+                caja_activa = [qx_s, qy_s, ql_s, ql_s]
                 rostro_pdi_valido = True
+                frames_sin_rostro_acq = 0
+            else:
+                frames_sin_rostro_acq += 1
+                if caja_suave_acq is not None and frames_sin_rostro_acq <= 6:
+                    # Persistencia breve de 6 frames para evitar parpadeo momentáneo
+                    ql_s = max(min_lado_rostro, min(int(round(caja_suave_acq[2])), min(W, H)))
+                    qx_s = int(np.clip(round(caja_suave_acq[0]), 0, max(0, W - ql_s)))
+                    qy_s = int(np.clip(round(caja_suave_acq[1]), 0, max(0, H - ql_s)))
+                    caja_activa = [qx_s, qy_s, ql_s, ql_s]
+                    rostro_pdi_valido = True
+                else:
+                    caja_suave_acq = None
+                    caja_activa = cuadrado_fijo
+                    rostro_pdi_valido = False
         else:
+            caja_suave_acq = None
             rostro_pdi_valido = True
 
         qx, qy, qlado, _ = caja_activa
@@ -288,9 +360,13 @@ def opcion_captura_webcam():
         etiqueta_caja = (
             f"OBJETO/CLASE 0 [{qlado}x{qlado}]"
             if id_sel == 4
-            else f"{modo_txt}: {qlado}x{qlado} | {estado_nit}"
+            else (
+                f"{modo_txt}: {qlado}x{qlado} | {estado_nit}"
+                if rostro_pdi_valido
+                else "BUSCANDO ROSTRO... (centre su cara o pulse [T]=FIJO)"
+            )
         )
-        cv2.putText(frame_vis, etiqueta_caja, (qx, max(20, qy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color_caja, 1, cv2.LINE_AA)
+        cv2.putText(frame_vis, etiqueta_caja, (qx, max(20, qy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.44, color_caja, 1, cv2.LINE_AA)
 
         # Filtrar esquinas de fondo con IoU == 0 respecto a la caja activa
         esquinas_validas = [e for e in esquinas_fondo if calcular_iou(e, caja_activa) == 0.0]
@@ -301,7 +377,7 @@ def opcion_captura_webcam():
         cv2.rectangle(frame_vis, (8, H - 72), (W - 8, H - 8), (20, 20, 20), -1)
         cv2.putText(
             frame_vis,
-            f"Cam: {'ESP32-CAM' if usar_esp32 else 'Laptop'} | {nombre_sel[:18]} | Sesion: +{capturadas_sesion}/{meta_nuevas} (Total:{contador_rostros}) | C0:{contador_fondo}",
+            f"Cam: {'ESP32-CAM' if usar_esp32 else 'Laptop'} | {nombre_limpio[:18]} | Sesion: +{capturadas_sesion}/{meta_nuevas} (Total:{contador_rostros}) | C0:{contador_fondo}",
             (14, H - 48),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.44,
@@ -311,10 +387,10 @@ def opcion_captura_webcam():
         estado_auto = "AUTO ON" if modo_auto else "AUTO OFF [A]"
         cv2.putText(
             frame_vis,
-            f"{estado_auto} | [ESP]=Foto | [T]=Modo({modo_txt}) | [F]=Objeto | [Q]=Salir",
+            f"{estado_auto} | [ESP]=Foto | [T]=Modo({modo_txt}) | [+/-]=Tam | [Q]=Salir",
             (14, H - 22),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
+            0.41,
             (0, 220, 255),
             1,
         )
@@ -333,7 +409,12 @@ def opcion_captura_webcam():
             print(f"\n[MODO AUTO] {'Activado' if modo_auto else 'Desactivado'}")
         elif tecla in [ord("t"), ord("T")] and id_sel != 4:
             modo_auto_recorte = not modo_auto_recorte
+            caja_suave_acq = None
             print(f"\n[ENCUADRE] Cambiado a: {'AUTO-SEGUIMIENTO PDI' if modo_auto_recorte else 'RECUADRO FIJO CENTRAL'}")
+        elif tecla in [ord("+"), ord("=")] and (not modo_auto_recorte or id_sel == 4):
+            factor_fijo = min(0.66, factor_fijo + 0.04)
+        elif tecla in [ord("-"), ord("_")] and (not modo_auto_recorte or id_sel == 4):
+            factor_fijo = max(0.26, factor_fijo - 0.04)
         elif tecla in [ord("f"), ord("F")]:
             if parche_activo.shape[0] >= 32 and parche_activo.shape[1] >= 32:
                 img_f_64, _ = preprocesar_ventana_64x64(parche_activo)

@@ -1,17 +1,17 @@
 {
   "esp32": {
     "habilitado": true,
-    "ip": "192.168.100.77",
+    "ip": "10.198.13.94",
     "puerto_control": 80,
-    "puerto_stream": 80,
+    "puerto_stream": 81,
     "usar_camara_esp32": true,
     "rotar_180": false,
     "voltear_horizontal": false
   },
   "telegram": {
-    "habilitado": false,
-    "bot_token": "PON_AQUI_TU_TOKEN_DE_BOTFATHER",
-    "chat_id": "PON_AQUI_TU_CHAT_ID",
+    "habilitado": true,
+    "bot_token": "9028314051:AAEIA6875e6EsVOcPO9IRxpwuPVNJjEtpfk",
+    "chat_id": "1297528804",
     "nombre_lugar": "Laboratorio FISEI - UTA",
     "cooldown_autorizado_seg": 15,
     "cooldown_alerta_seg": 15,

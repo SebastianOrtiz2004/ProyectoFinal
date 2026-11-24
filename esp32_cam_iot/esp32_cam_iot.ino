@@ -45,8 +45,8 @@
 
 // ===================== CONFIGURACIÓN WI-FI =====================
 // Red Wi-Fi configurada
-const char* WIFI_SSID     = "NETLIFE-ambwportizo1";
-const char* WIFI_PASSWORD = "1802891919";
+const char* WIFI_SSID     = "infinix";
+const char* WIFI_PASSWORD = "12345678@";
 
 // ===================== PINES DE HARDWARE =======================
 #define OLED_SDA_PIN   14
