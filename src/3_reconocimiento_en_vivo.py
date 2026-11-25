@@ -1620,6 +1620,7 @@ def ejecutar_demostracion():
             "resumen_rostros": [],
         },
         "fps_ia": 0.0,
+        "t_ultimo_frame_ia": time.time(),
     }
     ctrl_ia = {
         "activo": True,
@@ -1768,6 +1769,7 @@ def ejecutar_demostracion():
                     estado_ia["tracks_visibles"] = tr_snap
                     estado_ia["estado_or"] = est_or
                     estado_ia["fps_ia"] = fps_ia_loc
+                    estado_ia["t_ultimo_frame_ia"] = time.time()
             except Exception:
                 time.sleep(0.03)
 
@@ -1798,8 +1800,25 @@ def ejecutar_demostracion():
             tracks_visibles = list(estado_ia["tracks_visibles"])
             estado_or = dict(estado_ia["estado_or"])
             fps_ia_ui = float(estado_ia["fps_ia"])
+            t_ultimo_frame_ia = float(estado_ia["t_ultimo_frame_ia"])
 
         tiempo_actual = time.time()
+
+        # Fallo seguro ante pérdida de video: si el hilo IA no procesa frames
+        # nuevos en > 2.5 s (stream cortado, cámara desconectada, etc.), expirar
+        # el estado a ESPERA / PUERTA CERRADA para nunca mantener AUTORIZADO
+        # indefinidamente sobre un fotograma obsoleto.
+        TIMEOUT_SIN_FRAMES_SEG = 2.5
+        stream_vivo = (tiempo_actual - t_ultimo_frame_ia) < TIMEOUT_SIN_FRAMES_SEG
+        if not stream_vivo:
+            estado_or["hay_autorizado"] = False
+            estado_or["total_rostros"] = 0
+            estado_or["num_autorizados"] = 0
+            estado_or["num_desconocidos"] = 0
+            estado_or["nombres_autorizados"] = []
+            estado_or["resumen_rostros"] = []
+            tracks_visibles = []
+
         if estado_or["hay_autorizado"]:
             ultimo_acceso_valido = tiempo_actual
             ultimos_nombres_autorizados = estado_or["nombres_autorizados"]
