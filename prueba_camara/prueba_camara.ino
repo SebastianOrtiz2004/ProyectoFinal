@@ -7,8 +7,8 @@
 #include <Adafruit_SSD1306.h>
 
 // ----------------- DATOS DE TU WI-FI -----------------
-const char* ssid     = "infinix";
-const char* password = "12345678@";
+const char* ssid     = "TU_SSID_AQUI";
+const char* password = "TU_PASSWORD_AQUI";
 
 // ----------------- PINES PANTALLA OLED I2C -----------------
 #define OLED_SDA_PIN   14

@@ -1,6 +1,80 @@
-# Python Cache
+# ==============================================================================
+# .gitignore - Proyecto de Inteligencia Artificial & Control Biométrico
+# ==============================================================================
+
+# Python Cache & Bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
 *.pyd
 .pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Secrets, Credentials & Environment Variables
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+*.cert
+*.pfx
+secrets/
+
+# Compressed & Archive Files
+*.zip
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.bz2
+
+# Operating System Metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# IDEs & Text Editors
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Temporary Files, Logs & Scratch
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+scratch/
+
+# Reportes y Documentos Académicos Excluidos
+Informe_ProyectoFinal.tex
+GUIA_ESTUDIO_PROYECTO.md
+formatoInforme.tex
+imagenes/
+guias_estudio/
+
+# LaTeX Build Artifacts
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.out
+*.toc
+*.bbl
+*.blg

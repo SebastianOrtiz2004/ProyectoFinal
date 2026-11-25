@@ -44,9 +44,9 @@
 #include <Adafruit_SSD1306.h>
 
 // ===================== CONFIGURACIÓN WI-FI =====================
-// Red Wi-Fi configurada
-const char* WIFI_SSID     = "infinix";
-const char* WIFI_PASSWORD = "12345678@";
+// Configura aquí tus credenciales de red Wi-Fi local
+const char* WIFI_SSID     = "TU_SSID_AQUI";
+const char* WIFI_PASSWORD = "TU_PASSWORD_AQUI";
 
 // ===================== PINES DE HARDWARE =======================
 #define OLED_SDA_PIN   14
