@@ -1,9 +1,6 @@
-# Documentación Técnica y Matemática Completa del Proyecto
+# Documentación Técnica y Matemática del Proyecto
 ## Sistema Biométrico Multi-Rostro de Control de Acceso con PDI, Machine Learning, Deep Learning (CNN) e IoT
 
-- **Institución:** Universidad Técnica de Ambato (UTA) — Facultad de Ingeniería en Sistemas, Electrónica e Industrial (FISEI) — Carrera de Software
-- **Asignatura:** Inteligencia Artificial II (Docente: Ing. Rubén Nogales)
-- **Autores:** Sebastián Ortiz (`ID 0`) & Ángel Ayuquina (`ID 1`)
 - **Enfoque:** Pipeline biométrico completo construido **desde cero** (sin `Haar Cascades`, sin `dlib`, sin `MediaPipe`, sin `FaceNet` preentrenado), integrando Procesamiento Digital de Imágenes (PDI), Eigenfaces (PCA), 5 clasificadores clásicos de Machine Learning, una Red Neuronal Convolucional 2D (CNN), verificación *Open-Set*, seguimiento multi-rostro y despliegue IoT en **ESP32-CAM + Pantalla OLED 0.96" + Bot de Telegram**.
 
 ---

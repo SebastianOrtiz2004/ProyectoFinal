@@ -1,15 +1,13 @@
-# Especificación Técnica y Planificación Maestra: Sistema de Reconocimiento Facial y Control de Acceso (Agente IA)
+# Especificación Técnica y Arquitectura del Sistema: Control de Acceso Biométrico (Agente IA)
 
-> **Instrucción Directa para IA Generadora de Código:** Este documento constituye la especificación de ingeniería, matemática y algorítmica completa para desarrollar el proyecto de fin de semestre de la asignatura de **Inteligencia Artificial** (Universidad Técnica de Ambato - FISEI, Carrera de Software, Docente: Ing. Rubén Nogales).
-> Debes generar una solución modular en Python (compatible con Visual Studio Code) que implemente rigurosamente cada módulo aquí descrito: adquisición híbrida con **Distribución Automática por Ventanas**, preprocesamiento PDI clásico en formato `double` $[0.0, 1.0]$ (mitigación de ruido, ecualización, binarización auxiliar, `imfill`, `regionprops` y cuadrado envolvente simétrico $\text{lado} = \max(w, h)$), extracción de características mediante **PCA (Eigenfaces)** y **MSE**, clasificación jerárquica en dos etapas evaluando **todos** los algoritmos del sílabo (**k-NN, Árboles de Decisión, Random Forest, SVM, ANN** y un módulo posterior para **CNN**), control estricto de generalización sin *overfitting* ($E_{\text{in}} \approx E_{\text{test}}$), y demostración en tiempo real mediante cámara web simulando el actuador físico (apertura de puerta/cortina).
+> Este documento constituye la especificación de ingeniería, matemática y algorítmica completa del sistema: modular en Python implementando adquisición híbrida con **Distribución Automática por Ventanas**, preprocesamiento PDI clásico en formato `double` $[0.0, 1.0]$ (mitigación de ruido, ecualización, binarización auxiliar, `imfill`, `regionprops` y cuadrado envolvente simétrico $\text{lado} = \max(w, h)$), extracción de características mediante **PCA (Eigenfaces)** y **MSE**, clasificación jerárquica en dos etapas evaluando algoritmos de Machine Learning (**k-NN, Árboles de Decisión, Random Forest, SVM, ANN** y un módulo posterior para **CNN**), control estricto de generalización sin *overfitting* ($E_{\text{in}} \approx E_{\text{test}}$), y demostración en tiempo real mediante cámara web simulando el actuador físico (apertura de puerta/cortina).
 
-## 1. Contexto Académico y Arquitectura del Agente Inteligente
+## 1. Arquitectura del Agente Inteligente
 
-### 1.1 Datos de Referencia del Proyecto
+### 1.1 Características del Sistema
 
-* **Asignatura:** Inteligencia Artificial (Séptimo Semestre)
-* **Autores base en el código:** Sebastián Ortiz (`ID 0`), Ángel Ayuquina (`ID 1`), más soporte escalable para `ID 2` y `ID 3`.
-* **Restricción de librerías:** Se permite el uso completo de `numpy`, `pandas`, `matplotlib`, `opencv-python` (`cv2`), `scikit-learn` (`sklearn`) y `joblib`. **No** se deben utilizar librerías de mallas o puntos faciales preentrenados (*MediaPipe / Dlib landmarks*) en esta fase, ya que toda la extracción de características debe provenir del pipeline propio de PDI y reducción dimensional matemática.
+* **Soporte multiclase escalable:** Clasificación discriminativa de sujetos autorizados y rechazo de fondo o sujetos desconocidos.
+* **Restricción de librerías:** Se permite el uso de `numpy`, `pandas`, `matplotlib`, `opencv-python` (`cv2`), `scikit-learn` (`sklearn`) y `joblib`. **No** se utilizan librerías de mallas o puntos faciales preentrenados (*MediaPipe / Dlib landmarks*), ya que toda la extracción de características proviene del pipeline propio de PDI y reducción dimensional matemática.
 
 ### 1.2 Conceptualización como Agente Inteligente
 
