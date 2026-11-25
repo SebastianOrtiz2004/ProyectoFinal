@@ -380,5 +380,5 @@ Si dispones de un ESP32-CAM o deseas habilitar las notificaciones por Telegram, 
 Este proyecto está bajo la Licencia MIT. Consulta el archivo [LICENSE](LICENSE) para más detalles:
 
 ```
-Copyright (c) 2024-2026 Sebastian Ortiz
+Copyright (c) 2024-2026 Angel Ayuquina y Sebastian Ortiz
 ```
