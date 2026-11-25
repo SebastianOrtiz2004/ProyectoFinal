@@ -103,9 +103,9 @@ def entrenar_evaluar_cnn():
     F_cnn_total_ent = modulo_ent._aplicar_regularizacion_manifold_mixup(
         F_joint_ent_clean, y_ent, d_pca=None, tasa_frontera=0.044, sigma_rel=0.065, seed=42
     )
-    F_cnn_total_pru = modulo_ent._aplicar_regularizacion_manifold_mixup(
-        F_joint_pru_clean, y_pru, d_pca=None, tasa_frontera=0.054, sigma_rel=0.065, seed=100
-    )
+    # El conjunto de prueba se mantiene LIMPIO (sin Manifold Mixup) para
+    # coherencia con la evaluación de 2_entrenamiento_evaluacion.py.
+    F_cnn_total_pru = F_joint_pru_clean
     print(f"Dimensión del vector fusionado [PCA + Bottleneck Conv2D]: {F_cnn_total_ent.shape[1]}")
 
     print("Optimizando clasificador denso profundo con GridSearchCV (5 pliegues por bloques contiguos) y Early Stopping...")

@@ -673,13 +673,13 @@ def evaluar_experimento(nombre_etapa, X, y, nombres_clases=None, dict_fotos_real
     F_joint_pru_clean = np.hstack([F_pru_clean, F_conv_pru_base])
 
     tasa_tr = 0.046 if "Etapa 1" in nombre_etapa else 0.044
-    tasa_te = 0.060 if "Etapa 1" in nombre_etapa else 0.054
     F_joint_ent_reg = _aplicar_regularizacion_manifold_mixup(
         F_joint_ent_clean, y_ent, d_pca=None, tasa_frontera=tasa_tr, sigma_rel=0.065, seed=42
     )
-    F_joint_pru_reg = _aplicar_regularizacion_manifold_mixup(
-        F_joint_pru_clean, y_pru, d_pca=None, tasa_frontera=tasa_te, sigma_rel=0.065, seed=100
-    )
+    # El conjunto de prueba se mantiene LIMPIO (sin Manifold Mixup) para que
+    # todas las tablas, matrices de confusión y figuras sean 100% coherentes
+    # y defendibles: la evaluación mide rendimiento sobre datos no perturbados.
+    F_joint_pru_reg = F_joint_pru_clean
 
     F_ent_scaled = F_joint_ent_reg[:, :d_pca]
     F_pru_scaled = F_joint_pru_reg[:, :d_pca]
